@@ -413,6 +413,32 @@
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
 
+  function openSelectedDocument(doc) {
+    var artifact = selectedArtifact(doc);
+    var type = String(artifact.type || "").toLowerCase();
+    if (type === "json") {
+      openJson(doc);
+      return;
+    }
+    if (type === "md" || type === "markdown") {
+      openMarkdown(doc);
+      return;
+    }
+    if (type === "source" || type === "xlsx" || type === "xlsm") {
+      openXlsx(doc);
+      return;
+    }
+    if (type === "pdf") {
+      openPdf(doc);
+      return;
+    }
+    // Fallback: prefer available viewer in common order.
+    if (doc.json_available || doc.json_viewer_url) openJson(doc);
+    else if (doc.md_available || doc.md_viewer_url) openMarkdown(doc);
+    else if (doc.xlsx_available || doc.xlsx_view_url) openXlsx(doc);
+    else if (doc.pdf_available || doc.pdf_view_url) openPdf(doc);
+  }
+
   function renderSelectedChips() {
     selectedChips.innerHTML = "";
     if (selected.size === 0) {
@@ -422,16 +448,23 @@
     loadedFiles.hidden = false;
     selected.forEach(function (doc, key) {
       var chip = document.createElement("div");
-      chip.className = "chip";
-      var label = document.createElement("span");
+      chip.className = "chip chip-selectable";
+      var label = document.createElement("button");
+      label.type = "button";
+      label.className = "chip-open";
       var artifact = selectedArtifact(doc);
       label.textContent =
         (doc.kind ? "[" + doc.kind + "] " : "") + artifact.name;
+      label.title = "새 탭에서 열기";
+      label.addEventListener("click", function () {
+        openSelectedDocument(doc);
+      });
       var remove = document.createElement("button");
       remove.type = "button";
       remove.setAttribute("aria-label", "제거");
       remove.textContent = "×";
-      remove.addEventListener("click", function () {
+      remove.addEventListener("click", function (event) {
+        event.stopPropagation();
         selected.delete(key);
         renderSelectedChips();
         renderDocList();

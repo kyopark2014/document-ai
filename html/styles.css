@@ -497,14 +497,31 @@ body::before {
   padding: 0.4rem 0.55rem 0.4rem 0.7rem;
 }
 
-.chip span {
+.chip span,
+.chip .chip-open {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 18rem;
 }
 
-.chip button {
+.chip .chip-open {
+  border: 0;
+  background: transparent;
+  color: var(--teal-deep);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
+.chip .chip-open:hover {
+  color: var(--ink);
+}
+
+.chip button[aria-label="제거"] {
   border: 0;
   background: transparent;
   color: var(--ink-soft);
