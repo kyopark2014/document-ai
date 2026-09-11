@@ -32,6 +32,9 @@ bucket_name_prefix = "storage-for-document-ai"
 jobs_table_name = "dynamodb-document-ai-jobs"
 lambda_harness_name = "lambda-harness-document-ai"
 lambda_harness_role_name = "lambda-harness-document-ai-role"
+lambda_lmi_operator_role_name = "lambda-lmi-operator-document-ai"
+lambda_capacity_provider_name = "cp-document-ai"
+lambda_lmi_sg_name = "document-ai-lmi-sg"
 api_harness_name = "api-harness-document-ai"
 code_interpreter_name = "document_ai_code"
 DEFAULT_HARNESS_SKILLS = [
@@ -42,6 +45,12 @@ DEFAULT_HARNESS_SKILLS = [
     "xlsx",
 ]
 DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+# Async Event invoke on Lambda Managed Instances (sync API paths still ≤15m).
+LAMBDA_JOB_TIMEOUT_SECONDS = 1800
+HARNESS_TIMEOUT_SECONDS = 1800
+LMI_MAX_VCPU_COUNT = 30
+LMI_MIN_EXECUTION_ENVIRONMENTS = 3
+LMI_MAX_EXECUTION_ENVIRONMENTS = 6
 WEB_S3_PREFIX = "web"
 region = "us-west-2"
 COMPANY_NAME = "문서 분석 솔루션"
@@ -49,7 +58,7 @@ COMPANY_NAME = "문서 분석 솔루션"
 _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 
 bucket_name = ""
-lambda_python_runtime = "python3.12"
+lambda_python_runtime = "python3.13"
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 lambda_base_dir = script_dir
@@ -67,6 +76,7 @@ s3_client = boto3.client("s3", region_name=region)
 iam_client = boto3.client("iam", region_name=region)
 dynamodb_client = boto3.client("dynamodb", region_name=region)
 lambda_client = boto3.client("lambda", region_name=region)
+ec2_client = boto3.client("ec2", region_name=region)
 apigatewayv2_client = boto3.client("apigatewayv2", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name="us-east-1")
 agentcore_control_client = boto3.client(
@@ -529,6 +539,222 @@ def create_lambda_execution_role(
     return role_arn
 
 
+def create_lmi_operator_role() -> str:
+    """IAM role Lambda uses to manage EC2 for Managed Instances capacity providers."""
+    logger.info(f"Creating LMI operator role: {lambda_lmi_operator_role_name}")
+    assume_role_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+    return create_iam_role(
+        lambda_lmi_operator_role_name,
+        assume_role_policy,
+        managed_policies=[
+            "arn:aws:iam::aws:policy/AWSLambdaManagedEC2ResourceOperator"
+        ],
+    )
+
+
+def resolve_lmi_vpc_config() -> Dict[str, List[str]]:
+    """Use default VPC public subnets + a dedicated security group for LMI."""
+    logger.info("Resolving VPC config for Lambda Managed Instances")
+    vpcs = ec2_client.describe_vpcs(
+        Filters=[{"Name": "isDefault", "Values": ["true"]}]
+    ).get("Vpcs") or []
+    if not vpcs:
+        raise RuntimeError(
+            "No default VPC found. Create a default VPC or pass custom subnets."
+        )
+    vpc_id = vpcs[0]["VpcId"]
+    subnets = ec2_client.describe_subnets(
+        Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "default-for-az", "Values": ["true"]},
+        ]
+    ).get("Subnets") or []
+    if len(subnets) < 2:
+        subnets = ec2_client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("Subnets") or []
+    # Prefer public MapPublicIpOnLaunch subnets across AZs.
+    public = [s for s in subnets if s.get("MapPublicIpOnLaunch")]
+    chosen = public or subnets
+    by_az: Dict[str, str] = {}
+    for s in sorted(chosen, key=lambda x: x.get("AvailabilityZone") or ""):
+        az = s.get("AvailabilityZone") or ""
+        if az and az not in by_az:
+            by_az[az] = s["SubnetId"]
+    subnet_ids = list(by_az.values())[:3]
+    if not subnet_ids:
+        raise RuntimeError(f"No subnets available in default VPC {vpc_id}")
+
+    sg_id = None
+    existing = ec2_client.describe_security_groups(
+        Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "group-name", "Values": [lambda_lmi_sg_name]},
+        ]
+    ).get("SecurityGroups") or []
+    if existing:
+        sg_id = existing[0]["GroupId"]
+        logger.info(f"  Reusing security group: {sg_id}")
+    else:
+        created = ec2_client.create_security_group(
+            GroupName=lambda_lmi_sg_name,
+            Description="Outbound access for document-ai Lambda Managed Instances",
+            VpcId=vpc_id,
+            TagSpecifications=[
+                {
+                    "ResourceType": "security-group",
+                    "Tags": [
+                        {"Key": "Project", "Value": project_name},
+                        {"Key": "Name", "Value": lambda_lmi_sg_name},
+                    ],
+                }
+            ],
+        )
+        sg_id = created["GroupId"]
+        # Default SG already allows all egress; ensure it.
+        try:
+            ec2_client.authorize_security_group_egress(
+                GroupId=sg_id,
+                IpPermissions=[
+                    {
+                        "IpProtocol": "-1",
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in (
+                "InvalidPermission.Duplicate",
+                "InvalidPermission.Duplicate",
+            ):
+                # Some accounts already have default allow-all egress.
+                logger.debug(f"  egress authorize skipped: {e}")
+        logger.info(f"  ✓ Security group created: {sg_id}")
+
+    logger.info(f"  VPC={vpc_id} subnets={subnet_ids} sg={sg_id}")
+    return {"SubnetIds": subnet_ids, "SecurityGroupIds": [sg_id]}
+
+
+def create_or_get_capacity_provider(operator_role_arn: str) -> str:
+    """Create or reuse the Lambda Managed Instances capacity provider."""
+    logger.info(f"Creating capacity provider: {lambda_capacity_provider_name}")
+    expected_arn = (
+        f"arn:aws:lambda:{region}:{account_id}:capacity-provider:"
+        f"{lambda_capacity_provider_name}"
+    )
+    try:
+        existing = lambda_client.get_capacity_provider(
+            CapacityProviderName=lambda_capacity_provider_name
+        )
+        arn = (
+            (existing.get("CapacityProvider") or {}).get("CapacityProviderArn")
+            or existing.get("CapacityProviderArn")
+            or expected_arn
+        )
+        logger.info(f"  Capacity provider already exists: {arn}")
+        return arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in (
+            "ResourceNotFoundException",
+            "CapacityProviderNotFoundException",
+        ):
+            # Older error code variants
+            if "NotFound" not in e.response["Error"]["Code"]:
+                raise
+
+    vpc_config = resolve_lmi_vpc_config()
+    try:
+        response = lambda_client.create_capacity_provider(
+            CapacityProviderName=lambda_capacity_provider_name,
+            VpcConfig=vpc_config,
+            PermissionsConfig={
+                "CapacityProviderOperatorRoleArn": operator_role_arn
+            },
+            InstanceRequirements={"Architectures": ["x86_64"]},
+            CapacityProviderScalingConfig={
+                "ScalingMode": "Auto",
+                "MaxVCpuCount": LMI_MAX_VCPU_COUNT,
+            },
+            Tags={"Project": project_name},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceConflictException":
+            raise
+        response = lambda_client.get_capacity_provider(
+            CapacityProviderName=lambda_capacity_provider_name
+        )
+
+    arn = (
+        (response.get("CapacityProvider") or {}).get("CapacityProviderArn")
+        or response.get("CapacityProviderArn")
+        or expected_arn
+    )
+    logger.info(f"✓ Capacity provider ready: {arn}")
+    return arn
+
+
+def publish_lmi_function(function_name: str) -> str:
+    """Publish $LATEST.PUBLISHED so the function runs on Managed Instances."""
+    logger.info(f"Publishing LMI version for {function_name}")
+    wait_for_lambda_function_ready(function_name)
+    response = lambda_client.publish_version(
+        FunctionName=function_name,
+        PublishTo="LATEST_PUBLISHED",
+        Description="document-ai LMI published version",
+    )
+    version = response.get("Version") or "$LATEST.PUBLISHED"
+    published_arn = response.get("FunctionArn") or (
+        f"arn:aws:lambda:{region}:{account_id}:function:{function_name}:{version}"
+    )
+    # Wait until the published qualifier is Active.
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        cfg = lambda_client.get_function_configuration(
+            FunctionName=function_name,
+            Qualifier=version,
+        )
+        state = cfg.get("State") or ""
+        last = cfg.get("LastUpdateStatus") or ""
+        if state == "Active" and last in ("Successful", ""):
+            break
+        if state == "Failed" or last == "Failed":
+            raise RuntimeError(
+                f"LMI publish failed for {function_name}: "
+                f"{cfg.get('StateReason') or cfg.get('LastUpdateStatusReason')}"
+            )
+        time.sleep(5)
+    else:
+        raise TimeoutError(f"Timed out waiting for {function_name}:{version} Active")
+
+    try:
+        lambda_client.put_function_scaling_config(
+            FunctionName=function_name,
+            Qualifier=version,
+            FunctionScalingConfig={
+                "MinExecutionEnvironments": LMI_MIN_EXECUTION_ENVIRONMENTS,
+                "MaxExecutionEnvironments": LMI_MAX_EXECUTION_ENVIRONMENTS,
+            },
+        )
+        logger.info(
+            f"  ✓ Scaling config min={LMI_MIN_EXECUTION_ENVIRONMENTS} "
+            f"max={LMI_MAX_EXECUTION_ENVIRONMENTS}"
+        )
+    except ClientError as e:
+        logger.warning(f"  Could not set function scaling config: {e}")
+
+    logger.info(f"✓ Published {published_arn}")
+    return published_arn
+
+
 def lambda_function_exists(function_name: str) -> bool:
     """Check whether a Lambda function already exists."""
     try:
@@ -556,6 +782,7 @@ def update_lambda_function_configuration(
     timeout: int,
     memory_size: int = 128,
     environment: Optional[Dict[str, str]] = None,
+    capacity_provider_arn: Optional[str] = None,
     max_retries: int = 6,
 ):
     """Update Lambda configuration with retry while function update is in progress."""
@@ -570,6 +797,13 @@ def update_lambda_function_configuration(
     }
     if environment:
         update_kwargs["Environment"] = {"Variables": environment}
+    if capacity_provider_arn:
+        update_kwargs["CapacityProviderConfig"] = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": capacity_provider_arn,
+                "PerExecutionEnvironmentMaxConcurrency": 10,
+            }
+        }
 
     for attempt in range(max_retries):
         try:
@@ -607,8 +841,9 @@ def deploy_lambda_function(
     environment: Optional[Dict[str, str]] = None,
     include_node_modules: bool = False,
     pip_packages: Optional[List[str]] = None,
+    capacity_provider_arn: Optional[str] = None,
 ) -> str:
-    """Create or update Lambda function."""
+    """Create or update Lambda function (optionally on Managed Instances)."""
     logger.info(f"Deploying Lambda function: {function_name}")
 
     zip_bytes = package_lambda(
@@ -617,6 +852,35 @@ def deploy_lambda_function(
         pip_packages=pip_packages,
     )
     function_exists = lambda_function_exists(function_name)
+    capacity_cfg = None
+    if capacity_provider_arn:
+        capacity_cfg = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": capacity_provider_arn,
+                "PerExecutionEnvironmentMaxConcurrency": 10,
+            }
+        }
+
+    # Existing "Lambda Default" functions cannot gain CapacityProviderConfig via update.
+    if function_exists and capacity_provider_arn:
+        cfg = lambda_client.get_function_configuration(FunctionName=function_name)
+        has_cp = bool(cfg.get("CapacityProviderConfig"))
+        if not has_cp:
+            logger.warning(
+                f"Recreating {function_name}: CapacityProviderConfig requires a new "
+                "Managed Instances function (cannot convert Lambda Default in place)"
+            )
+            try:
+                lambda_client.delete_function_url_config(FunctionName=function_name)
+            except ClientError:
+                pass
+            lambda_client.delete_function(FunctionName=function_name)
+            # Wait until name is free
+            for _ in range(30):
+                if not lambda_function_exists(function_name):
+                    break
+                time.sleep(2)
+            function_exists = False
 
     if not function_exists:
         create_kwargs = {
@@ -628,9 +892,12 @@ def deploy_lambda_function(
             "Description": description,
             "Timeout": timeout,
             "MemorySize": memory_size,
+            "Architectures": ["x86_64"],
         }
         if environment:
             create_kwargs["Environment"] = {"Variables": environment}
+        if capacity_cfg:
+            create_kwargs["CapacityProviderConfig"] = capacity_cfg
 
         max_retries = 6
         for attempt in range(max_retries):
@@ -638,6 +905,17 @@ def deploy_lambda_function(
                 response = lambda_client.create_function(**create_kwargs)
                 function_arn = response["FunctionArn"]
                 logger.info(f"✓ Lambda function created: {function_arn}")
+                wait_for_lambda_function_ready(function_name)
+                if capacity_provider_arn:
+                    publish_lmi_function(function_name)
+                    try:
+                        lambda_client.put_function_event_invoke_config(
+                            FunctionName=function_name,
+                            MaximumRetryAttempts=1,
+                            MaximumEventAgeInSeconds=6 * 3600,
+                        )
+                    except ClientError as e:
+                        logger.warning(f"  Could not set event invoke config: {e}")
                 return function_arn
 
             except ClientError as e:
@@ -684,8 +962,20 @@ def deploy_lambda_function(
         timeout=timeout,
         memory_size=memory_size,
         environment=environment,
+        capacity_provider_arn=capacity_provider_arn,
     )
     wait_for_lambda_function_ready(function_name)
+    if capacity_provider_arn:
+        publish_lmi_function(function_name)
+        try:
+            lambda_client.put_function_event_invoke_config(
+                FunctionName=function_name,
+                MaximumRetryAttempts=1,
+                MaximumEventAgeInSeconds=6 * 3600,
+            )
+            logger.info("  ✓ Async invoke retry=1 (avoid multi-hour stuck RUNNING)")
+        except ClientError as e:
+            logger.warning(f"  Could not set event invoke config: {e}")
 
     response = lambda_client.get_function(FunctionName=function_name)
     function_arn = response["Configuration"]["FunctionArn"]
@@ -1136,6 +1426,17 @@ def ensure_harness_model(harness_id: str, model_id: str = DEFAULT_MODEL_ID) -> N
     )
 
 
+def ensure_harness_timeout(harness_id: str, timeout_seconds: int) -> None:
+    """Keep harness wall-clock timeout in sync (e.g. 1800s for long evaluations)."""
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current = h.get("timeoutSeconds")
+    if current == timeout_seconds:
+        logger.info(f"  Harness timeoutSeconds already {timeout_seconds}")
+        return
+    logger.info(f"  Updating harness timeoutSeconds {current!r} -> {timeout_seconds}")
+    update_harness_safe(harness_id, timeoutSeconds=timeout_seconds)
+
+
 def ensure_harness_tools(harness_id: str, code_interpreter_arn: str = "") -> None:
     desired = _default_harness_tools(code_interpreter_arn)
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
@@ -1288,7 +1589,7 @@ def create_or_get_harness(
                 },
                 maxIterations=20,
                 maxTokens=50000,
-                timeoutSeconds=300,
+                timeoutSeconds=HARNESS_TIMEOUT_SECONDS,
                 environment=environment,
                 environmentVariables=env_vars,
                 tags={"Project": project_name, "Env": "dev"},
@@ -1312,6 +1613,7 @@ def create_or_get_harness(
     ensure_harness_system_prompt(harness_id, s3_bucket)
     ensure_harness_tools(harness_id, code_interpreter_arn)
     ensure_harness_skills(harness_id, s3_bucket)
+    ensure_harness_timeout(harness_id, HARNESS_TIMEOUT_SECONDS)
     harness_arn = wait_for_harness_ready(harness_id)
     return {
         "harness_id": harness_id,
@@ -1603,6 +1905,9 @@ def create_lambda_harness(
         ],
     )
 
+    operator_role_arn = create_lmi_operator_role()
+    capacity_provider_arn = create_or_get_capacity_provider(operator_role_arn)
+
     source_dir = os.path.join(lambda_base_dir, "lambda-harness")
     environment = {
         "HARNESS_ARN": harness_arn,
@@ -1618,19 +1923,24 @@ def create_lambda_harness(
         "COGNITO_USER_POOL_ID": ess_config.get("cognito_user_pool_id") or "",
         "COGNITO_CLIENT_ID": ess_config.get("cognito_client_id") or "",
         "COGNITO_REGION": ess_config.get("cognito_region") or region,
+        "LAMBDA_COMPUTE": "managed-instances",
+        "LAMBDA_JOB_TIMEOUT_SECONDS": str(LAMBDA_JOB_TIMEOUT_SECONDS),
     }
 
     return deploy_lambda_function(
         function_name=lambda_harness_name,
         role_arn=role_arn,
         source_dir=source_dir,
-        description="Async jobs/documents API + worker proxy to AgentCore Harness",
+        description=(
+            "LMI async jobs/documents API + worker proxy to AgentCore Harness"
+        ),
         handler="lambda_function.handler",
         runtime=lambda_python_runtime,
-        timeout=300,
-        memory_size=512,
+        timeout=LAMBDA_JOB_TIMEOUT_SECONDS,
+        memory_size=2048,
         pip_packages=["boto3>=1.40.0"],
         environment=environment,
+        capacity_provider_arn=capacity_provider_arn,
     )
 
 
@@ -1879,6 +2189,10 @@ def deploy_harness_stack(
         "codeInterpreterName": code_info["code_interpreter_name"],
         "lambdaHarnessName": lambda_harness_name,
         "lambdaHarnessArn": lambda_arn,
+        "lambdaCapacityProvider": lambda_capacity_provider_name,
+        "lambdaCompute": "managed-instances",
+        "lambdaJobTimeoutSeconds": LAMBDA_JOB_TIMEOUT_SECONDS,
+        "harnessTimeoutSeconds": HARNESS_TIMEOUT_SECONDS,
         "jobsTableName": jobs_info["jobsTableName"],
         "jobsTableArn": jobs_info["jobsTableArn"],
         "apiGatewayId": api_info["api_id"],

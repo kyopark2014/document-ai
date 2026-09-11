@@ -30,6 +30,9 @@ jobs_table_name = "dynamodb-document-ai-jobs"
 lambda_harness_name = "lambda-harness-document-ai"
 api_harness_name = "api-harness-document-ai"
 lambda_harness_role_name = "lambda-harness-document-ai-role"
+lambda_lmi_operator_role_name = "lambda-lmi-operator-document-ai"
+lambda_capacity_provider_name = "cp-document-ai"
+lambda_lmi_sg_name = "document-ai-lmi-sg"
 code_interpreter_name = "document_ai_code"
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +44,7 @@ s3_client = boto3.client("s3", region_name=region)
 iam_client = boto3.client("iam", region_name=region)
 dynamodb_client = boto3.client("dynamodb", region_name=region)
 lambda_client = boto3.client("lambda", region_name=region)
+ec2_client = boto3.client("ec2", region_name=region)
 apigatewayv2_client = boto3.client("apigatewayv2", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name="us-east-1")
 agentcore_control_client = boto3.client(
@@ -209,6 +213,71 @@ def delete_lambda_function(function_name: str) -> bool:
         raise
 
 
+def delete_capacity_provider() -> bool:
+    """Delete Lambda Managed Instances capacity provider."""
+    logger.info(f"Deleting capacity provider: {lambda_capacity_provider_name}")
+    try:
+        lambda_client.delete_capacity_provider(
+            CapacityProviderName=lambda_capacity_provider_name
+        )
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            try:
+                lambda_client.get_capacity_provider(
+                    CapacityProviderName=lambda_capacity_provider_name
+                )
+                time.sleep(5)
+            except ClientError as e:
+                if "NotFound" in e.response["Error"]["Code"]:
+                    logger.info(
+                        f"✓ Deleted capacity provider: {lambda_capacity_provider_name}"
+                    )
+                    return True
+                raise
+        logger.warning(
+            f"Capacity provider delete still pending: {lambda_capacity_provider_name}"
+        )
+        return True
+    except ClientError as e:
+        if "NotFound" in e.response["Error"]["Code"]:
+            logger.warning(
+                f"Capacity provider not found: {lambda_capacity_provider_name}"
+            )
+            return False
+        logger.warning(f"Could not delete capacity provider: {e}")
+        return False
+
+
+def delete_lmi_security_group() -> bool:
+    """Delete the dedicated LMI security group (keep default VPC)."""
+    try:
+        groups = (
+            ec2_client.describe_security_groups(
+                Filters=[{"Name": "group-name", "Values": [lambda_lmi_sg_name]}]
+            ).get("SecurityGroups")
+            or []
+        )
+        if not groups:
+            logger.warning(f"Security group not found: {lambda_lmi_sg_name}")
+            return False
+        sg_id = groups[0]["GroupId"]
+        for _ in range(12):
+            try:
+                ec2_client.delete_security_group(GroupId=sg_id)
+                logger.info(f"✓ Deleted security group: {sg_id}")
+                return True
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "DependencyViolation":
+                    time.sleep(10)
+                    continue
+                raise
+        logger.warning(f"Could not delete security group yet (in use): {sg_id}")
+        return False
+    except ClientError as e:
+        logger.warning(f"Could not delete LMI security group: {e}")
+        return False
+
+
 def delete_jobs_table(config: Dict) -> bool:
     """Delete async Harness jobs DynamoDB table."""
     name = config.get("jobsTableName") or jobs_table_name
@@ -366,6 +435,7 @@ def delete_iam_roles() -> int:
     logger.info("Deleting IAM roles")
     role_names = [
         lambda_harness_role_name,
+        lambda_lmi_operator_role_name,
         f"role-harness-for-{project_name}-{region}",
     ]
     deleted_count = 0
@@ -684,6 +754,8 @@ def main():
             lambda_harness_name
         )
         deletion_summary["lambdaHarness"] = delete_lambda_function(lambda_harness_name)
+        deletion_summary["capacityProvider"] = delete_capacity_provider()
+        deletion_summary["lmiSecurityGroup"] = delete_lmi_security_group()
         deletion_summary["jobsTable"] = delete_jobs_table(config)
         deletion_summary["harness"] = delete_harness(config)
         deletion_summary["codeInterpreter"] = delete_code_interpreter(config)
