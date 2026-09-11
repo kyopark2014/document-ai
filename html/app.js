@@ -102,9 +102,79 @@
         var clean = url.replace(/[),.;]+$/, "");
         var key = extractS3Key(clean);
         if (!key) return url;
-        return rewriteDownloadUrl(clean, key) + url.slice(clean.length);
+        return rewriteSharedArtifactUrl(clean, key) + url.slice(clean.length);
       }
     );
+  }
+
+  function rewriteSharedArtifactUrl(url, s3Key) {
+    var key = s3Key || extractS3Key(url);
+    if (!key || !documentsUrl) return rewriteDownloadUrl(url, key);
+    var lower = key.toLowerCase();
+    var isViewer =
+      /^artifacts\//i.test(key) &&
+      /\.(md|markdown|json|csv)$/i.test(lower);
+    if (!isViewer) return rewriteDownloadUrl(url, key);
+
+    var base = String(documentsUrl).replace(/\/documents\/?$/, "");
+    var token = (auth && (auth.accessToken || auth.idToken)) || "";
+    var parts = key.split("/");
+    // artifacts/{user}/rest...
+    var rest = parts.length >= 3 ? parts.slice(2).join("/") : parts.slice(1).join("/");
+    var encoded = rest
+      .split("/")
+      .filter(Boolean)
+      .map(function (p) {
+        return encodeURIComponent(p);
+      })
+      .join("/");
+    return (
+      base.replace(/\/$/, "") +
+      "/artifacts/view/" +
+      encoded +
+      (token ? "?access_token=" + encodeURIComponent(token) : "")
+    );
+  }
+
+  function rewriteDownloadUrl(url, s3Key) {
+    var key = s3Key || extractS3Key(url);
+    if (key && documentsUrl) {
+      var base = String(documentsUrl).replace(/\/documents\/?$/, "");
+      var token = (auth && (auth.accessToken || auth.idToken)) || "";
+      return (
+        base.replace(/\/$/, "") +
+        "/download?key=" +
+        encodeURIComponent(key) +
+        (token ? "&access_token=" + encodeURIComponent(token) : "")
+      );
+    }
+    return url;
+  }
+
+  function extractS3Key(url) {
+    try {
+      var u = new URL(url);
+      var host = u.hostname;
+      var path = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+      // bucket.s3...amazonaws.com/key
+      if (/\.s3[.\-].*\.amazonaws\.com$/i.test(host) || /\.s3\.amazonaws\.com$/i.test(host)) {
+        return path;
+      }
+      // s3.region.amazonaws.com/bucket/key
+      if (/^s3[.\-]/i.test(host) && host.indexOf("amazonaws.com") !== -1) {
+        var parts = path.split("/");
+        if (parts.length >= 2) return parts.slice(1).join("/");
+      }
+      // CloudFront / custom sharing host: path is the object key
+      if (/^(artifacts|images|docs)\//i.test(path)) {
+        return path;
+      }
+      // Already an API viewer URL — leave as-is (caller won't rewrite)
+      if (/\/artifacts\/(view|download)\//i.test(u.pathname)) {
+        return "";
+      }
+    } catch (_) {}
+    return "";
   }
 
   function setDownloads(links) {
@@ -233,39 +303,6 @@
       downloadLinks: (job && job.downloadLinks) || [],
     });
     clearActiveJob();
-  }
-
-  function rewriteDownloadUrl(url, s3Key) {
-    var key = s3Key || extractS3Key(url);
-    if (key && documentsUrl) {
-      var base = String(documentsUrl).replace(/\/documents\/?$/, "");
-      var token = (auth && (auth.accessToken || auth.idToken)) || "";
-      return (
-        base.replace(/\/$/, "") +
-        "/download?key=" +
-        encodeURIComponent(key) +
-        (token ? "&access_token=" + encodeURIComponent(token) : "")
-      );
-    }
-    return url;
-  }
-
-  function extractS3Key(url) {
-    try {
-      var u = new URL(url);
-      var host = u.hostname;
-      var path = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
-      // bucket.s3...amazonaws.com/key
-      if (/\.s3[.\-].*\.amazonaws\.com$/i.test(host) || /\.s3\.amazonaws\.com$/i.test(host)) {
-        return path;
-      }
-      // s3.region.amazonaws.com/bucket/key
-      if (/^s3[.\-]/i.test(host) && host.indexOf("amazonaws.com") !== -1) {
-        var parts = path.split("/");
-        if (parts.length >= 2) return parts.slice(1).join("/");
-      }
-    } catch (_) {}
-    return "";
   }
 
   function getSessionId() {

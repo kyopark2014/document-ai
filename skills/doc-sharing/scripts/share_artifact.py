@@ -124,6 +124,15 @@ def share_artifact(
         or cfg.get("sharing_url")
         or ""
     ).rstrip("/")
+    api_base = (
+        os.environ.get("API_BASE_URL")
+        or os.environ.get("APP_URL")
+        or cfg.get("api_base_url")
+        or cfg.get("apiDocumentsUrl")
+        or ""
+    ).rstrip("/")
+    if api_base.endswith("/documents"):
+        api_base = api_base[: -len("/documents")]
     region = (
         region
         or os.environ.get("AWS_REGION")
@@ -148,11 +157,22 @@ def share_artifact(
     else:
         url = f"https://{bucket}.s3.{region}.amazonaws.com/{quote(dest_key, safe='/')}"
 
+    viewer_url = None
+    lower_rest = rest.lower()
+    if api_base and prefix == "artifacts" and (
+        lower_rest.endswith(".md")
+        or lower_rest.endswith(".markdown")
+        or lower_rest.endswith(".json")
+        or lower_rest.endswith(".csv")
+    ):
+        viewer_url = f"{api_base}/artifacts/view/{quote(rest, safe='/')}"
+
     return {
         "ok": True,
         "bucket": bucket,
         "key": dest_key,
         "url": url,
+        "viewer_url": viewer_url,
         "actor_id": actor,
         "local_path": path,
         "content_type": content_type,

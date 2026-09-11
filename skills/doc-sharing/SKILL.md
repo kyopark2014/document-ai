@@ -1,11 +1,12 @@
 ---
 name: doc-sharing
 description: >
-  생성된 artifact(xlsx/pptx/docx/pdf/png/csv/md 등)를 document-ai S3의
+  생성된 artifact(xlsx/pptx/docx/pdf/png/csv/md/json 등)를 document-ai S3의
   artifacts/{actor_id}/… 로 업로드하고 CloudFront 다운로드 URL을 반환한다.
+  Markdown/JSON/CSV는 API viewer URL(viewer_url)도 반환한다.
   MCP가 아니라 code 인터프리터에서 로컬 파일을 직접 S3로 PutObject 한다.
   트리거: doc-sharing, share_artifact, 산출물 공유, CloudFront URL, 다운로드 링크,
-  artifact 업로드, 결과 파일 공유.
+  artifact 업로드, 결과 파일 공유, markdown viewer, json viewer, csv viewer.
 ---
 
 # doc-sharing
@@ -18,7 +19,8 @@ Code Interpreter에서 만든 산출물을 **프로젝트 S3 + CloudFront**로 �
 | 변수 | 의미 |
 |------|------|
 | `S3_BUCKET` | document-ai 버킷 (예: `storage-for-document-ai-…`) |
-| `SHARING_URL` | document-ai CloudFront base (예: `https://d15s8jy95a27a2.cloudfront.net`) |
+| `SHARING_URL` | document-ai CloudFront base |
+| `API_BASE_URL` / `api_base_url` | API Gateway base (예: `https://….execute-api….amazonaws.com`) — viewer_url용 |
 | `ARTIFACTS_DIR` | `/mnt/workspace/{actor_id}/artifacts` |
 | `ACTOR_ID` / `actor_id` | 프롬프트에 주어진 actor id |
 
@@ -29,8 +31,8 @@ Code Interpreter에서 만든 산출물을 **프로젝트 S3 + CloudFront**로 �
 ```
 - [ ] 1. 산출물을 ARTIFACTS_DIR (또는 images/docs) 아래에 저장
 - [ ] 2. doc-sharing skill 동기화 (필요 시)
-- [ ] 3. share_artifact.py 실행 → stdout JSON의 url 확인
-- [ ] 4. 최종 답변에 CloudFront URL 포함 (로컬 경로만 안내 금지)
+- [ ] 3. share_artifact.py 실행 → stdout JSON의 url / viewer_url 확인
+- [ ] 4. 최종 답변에 공유 URL 포함 (로컬 경로만 안내 금지)
 ```
 
 ### 1. skill 동기화
@@ -54,12 +56,23 @@ python3 /tmp/doc-sharing/scripts/share_artifact.py \
   "ok": true,
   "bucket": "storage-for-document-ai-…",
   "key": "artifacts/<actor_id>/reports/<file>.xlsx",
-  "url": "https://d15s8jy95a27a2.cloudfront.net/artifacts/<actor_id>/reports/<file>.xlsx",
+  "url": "https://….cloudfront.net/artifacts/<actor_id>/reports/<file>.xlsx",
+  "viewer_url": null,
   "actor_id": "<actor_id>"
 }
 ```
 
-파일이 여러 개면 **파일마다** 스크립트를 실행한다.
+Markdown / JSON / CSV:
+
+```json
+{
+  "viewer_url": "https://….execute-api….amazonaws.com/artifacts/view/report.md"
+}
+```
+
+- **일반 파일:** `url`(CloudFront)을 답변에 포함
+- **Markdown / JSON / CSV:** `viewer_url`이 있으면 **viewer_url을 우선** 안내
+- 파일이 여러 개면 **파일마다** 스크립트를 실행한다.
 
 ## 규칙
 

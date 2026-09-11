@@ -495,12 +495,12 @@ BASE_SYSTEM_PROMPT = (
     "\n"
     "## 역할\n"
     "- 사용자가 선택한 ESS 문서를 읽고 분석·요약·규정 적합성 평가·테스트케이스 도출을 수행합니다.\n"
-    "- 분석 결과는 마크다운으로 반환하고, 생성한 산출물(pptx/docx/xlsx 등)에는 "
-    "**doc-sharing skill이 반환한 CloudFront URL**을 포함하세요.\n"
+    "- 분석 결과는 마크다운으로 반환하고, 생성한 산출물(pptx/docx/xlsx/md/json/csv 등)에는 "
+    "**doc-sharing skill이 반환한 공유 URL**을 포함하세요.\n"
     "\n"
     "## Skills\n"
-    "- **doc-sharing**: 산출물을 document-ai S3로 업로드하고 CloudFront 다운로드 URL 반환 "
-    "(scripts/share_artifact.py)\n"
+    "- **doc-sharing**: 산출물을 document-ai S3로 업로드하고 CloudFront URL 반환 "
+    "(Markdown/JSON/CSV는 viewer_url 우선; scripts/share_artifact.py)\n"
     "- **regulation-evaluator**: 규정/컴플라이언스 평가 및 리포트 생성\n"
     "- **testcase-generator**: 요구사항·문서 기반 테스트케이스 생성\n"
     "- **pptx / docx / xlsx**: Office 문서 생성·편집 (프레젠테이션, 워드, 스프레드시트)\n"
@@ -520,13 +520,15 @@ BASE_SYSTEM_PROMPT = (
     "- 예: pip3 install <package>, pip3 show <package> (pip 금지)\n"
     "\n"
     "## Artifact sharing (REQUIRED) — doc-sharing skill\n"
-    "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML 등 결과 파일을 생성했다면, "
+    "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML/MD/JSON 등 결과 파일을 생성했다면, "
     "사용자에게 최종 답변하기 **전에** 반드시 **doc-sharing** skill의 "
     "`share_artifact.py`를 code 인터프리터로 실행하세요.\n"
     "- 로컬 경로(`/mnt/workspace/...`, ARTIFACTS_DIR)만 안내하는 것은 **금지**입니다. "
     "사용자는 그 경로에 접근할 수 없습니다.\n"
-    "- 스크립트가 반환한 CloudFront URL을 최종 답변에 **반드시** 포함하세요. "
+    "- 스크립트가 반환한 공유 URL을 최종 답변에 **반드시** 포함하세요. "
     "URL 없이 '생성 완료'만 말하면 실패입니다.\n"
+    "- Markdown(`.md`) / JSON(`.json`) / CSV(`.csv`)은 `viewer_url`이 있으면 "
+    "**viewer_url을 우선** 안내하세요. 그 외 파일은 CloudFront `url`을 안내하세요.\n"
     "- 파일이 여러 개면 파일마다 `share_artifact.py`를 각각 실행하세요.\n"
     "- 예:\n"
     "  `aws s3 sync s3://{skills_bucket}/skills/doc-sharing/ /tmp/doc-sharing/`\n"
@@ -541,7 +543,8 @@ BASE_SYSTEM_PROMPT = (
     "로드하고 code 인터프리터로 실행한다\n"
     "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
     "4. 결과 파일이 있으면 사용자 답변 전에 반드시 **doc-sharing** skill로 "
-    "CloudFront URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지)\n"
+    "공유 URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지; "
+    "Markdown/JSON/CSV는 viewer_url 우선)\n"
     "5. 공유 URL을 포함한 최종 결과를 사용자에게 전달한다\n"
     "\n"
     "## 도구\n"
@@ -1775,16 +1778,33 @@ def _prune_removed_skills_from_s3(s3_bucket_name: str) -> int:
     return removed
 
 
-def prepare_doc_sharing_skill_config(s3_bucket_name: str) -> None:
+def prepare_doc_sharing_skill_config(
+    s3_bucket_name: str, api_base_url: str = ""
+) -> None:
     """Write skills/doc-sharing/config.json for Code Interpreter fallback."""
     skill_dir = os.path.join(SKILLS_DIR, "doc-sharing")
     if not os.path.isdir(skill_dir):
         logger.warning(f"doc-sharing skill dir missing: {skill_dir}")
         return
     sharing_url = _resolve_sharing_url()
+    api_base = (api_base_url or "").rstrip("/")
+    if api_base.endswith("/documents"):
+        api_base = api_base[: -len("/documents")]
+    if not api_base:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            api_base = (
+                (cfg.get("apiDocumentsUrl") or cfg.get("api_endpoint") or "")
+                .rstrip("/")
+                .removesuffix("/documents")
+            )
+        except Exception:
+            pass
     payload = {
         "s3_bucket": s3_bucket_name,
         "sharing_url": sharing_url,
+        "api_base_url": api_base,
         "region": region,
     }
     dest = os.path.join(skill_dir, "config.json")
@@ -1793,18 +1813,19 @@ def prepare_doc_sharing_skill_config(s3_bucket_name: str) -> None:
         f.write("\n")
     logger.info(
         f"  doc-sharing config.json ready "
-        f"(bucket={s3_bucket_name}, sharing_url={sharing_url or '(none)'})"
+        f"(bucket={s3_bucket_name}, sharing_url={sharing_url or '(none)'}, "
+        f"api_base_url={api_base or '(none)'})"
     )
 
 
-def upload_skills_to_s3(s3_bucket_name: str) -> int:
+def upload_skills_to_s3(s3_bucket_name: str, api_base_url: str = "") -> int:
     """Upload skills/ to s3://{bucket}/skills/ for InvokeHarness S3 skill attach."""
     logger.info(f"Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
     if not os.path.isdir(SKILLS_DIR):
         logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping upload")
         return 0
 
-    prepare_doc_sharing_skill_config(s3_bucket_name)
+    prepare_doc_sharing_skill_config(s3_bucket_name, api_base_url=api_base_url)
 
     uploaded = 0
     failed = 0
@@ -2201,6 +2222,8 @@ def create_api_gateway(lambda_arn: str) -> Dict[str, str]:
         "GET /documents",
         "GET /documents/{kind}",
         "GET /documents/{kind}/{filename}/{view}",
+        "GET /artifacts/view/{proxy+}",
+        "GET /artifacts/download/{proxy+}",
         "GET /download",
     ):
         if route_key in existing_routes:
@@ -2290,6 +2313,17 @@ def deploy_harness_stack(
     )
     function_url = create_lambda_function_url(lambda_harness_name)
     api_info = create_api_gateway(lambda_arn)
+    api_base = (api_info.get("api_endpoint") or "").rstrip("/")
+    prepare_doc_sharing_skill_config(target_bucket, api_base_url=api_base)
+    try:
+        s3_client.upload_file(
+            os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
+            target_bucket,
+            f"{SKILLS_S3_PREFIX}/doc-sharing/config.json",
+            ExtraArgs={"ContentType": "application/json"},
+        )
+    except Exception as e:
+        logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
     skill_uris = [
         item["s3"]["uri"] for item in build_default_harness_skills(target_bucket)
     ]
@@ -2637,7 +2671,7 @@ def upload_web_to_s3(
                 content_type = "image/webp"
             extra = {"ContentType": content_type or "application/octet-stream"}
             if filename in ("config.js", "index.html", "app.js") or rel.startswith(
-                "images/hero"
+                "assets/hero"
             ):
                 extra["CacheControl"] = "no-cache, max-age=0"
             else:

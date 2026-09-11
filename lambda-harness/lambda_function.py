@@ -4,6 +4,9 @@ Public:
   GET  /health
   GET  /documents              → all kinds for authenticated Cognito user
   GET  /documents/{kind}       → regulations|projects|drawings|test_cases|test-cases
+  GET  /documents/{kind}/{filename}/{view}
+  GET  /artifacts/view/{path+} /artifacts/download/{path+}  → md/json/csv viewer
+  GET  /download?key=…
   POST /jobs                   → 202 { jobId, status, sessionId }
   GET  /jobs/{jobId}           → job status / result
   POST /invoke                 → sync InvokeHarness (short prompts only)
@@ -15,6 +18,8 @@ Internal (async Event invoke):
 from __future__ import annotations
 
 import html
+import io
+import csv
 import json
 import logging
 import os
@@ -72,6 +77,7 @@ DEFAULT_SKILLS = [
 
 ESS_S3_BUCKET = (os.environ.get("ESS_S3_BUCKET") or "").strip()
 ESS_SHARING_URL = (os.environ.get("ESS_SHARING_URL") or "").rstrip("/")
+SHARING_URL = (os.environ.get("SHARING_URL") or "").rstrip("/")
 COGNITO_USER_POOL_ID = (os.environ.get("COGNITO_USER_POOL_ID") or "").strip()
 COGNITO_CLIENT_ID = (os.environ.get("COGNITO_CLIENT_ID") or "").strip()
 COGNITO_REGION = (
@@ -905,7 +911,6 @@ def _simple_markdown_to_html(text: str) -> str:
         if not line.strip():
             out.append("")
             continue
-        # bold/italic-ish
         rendered = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
         rendered = re.sub(r"`([^`]+)`", r"<code>\1</code>", rendered)
         out.append(f"<p>{rendered}</p>")
@@ -916,9 +921,45 @@ def _simple_markdown_to_html(text: str) -> str:
     return "\n".join(out)
 
 
-def _build_markdown_viewer_page(file_name: str, text: str) -> str:
+def _viewer_topbar_actions(
+    *,
+    download_href: str = "",
+    raw_href: str = "",
+) -> str:
+    parts: List[str] = []
+    if download_href:
+        parts.append(
+            f'<a class="action" href="{html.escape(download_href, quote=True)}">Download</a>'
+        )
+    if raw_href:
+        parts.append(
+            f'<a class="action" href="{html.escape(raw_href, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">Raw</a>'
+        )
+    if not parts:
+        return ""
+    return '<div class="topbar-actions">' + "".join(parts) + "</div>"
+
+
+def _access_token_qs(event: Dict[str, Any]) -> str:
+    try:
+        token = _bearer_token(event)
+    except Exception:
+        return ""
+    if not token:
+        return ""
+    return f"access_token={quote(token)}"
+
+
+def _build_markdown_viewer_page(
+    file_name: str,
+    text: str,
+    *,
+    topbar_right_html: str = "",
+) -> str:
     title = html.escape(file_name)
     body = _simple_markdown_to_html(text)
+    actions = topbar_right_html or '<span class="badge">Markdown viewer</span>'
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -942,6 +983,8 @@ def _build_markdown_viewer_page(file_name: str, text: str) -> str:
       backdrop-filter: blur(8px);
     }}
     .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .topbar-actions {{ display: flex; align-items: center; gap: 14px; flex-shrink: 0; }}
+    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap; }}
     .badge {{ font-size: 12px; color: #8b949e; }}
     main {{ max-width: 920px; margin: 0 auto; padding: 24px 20px 64px; line-height: 1.65; }}
     main h1, main h2, main h3, main h4 {{ border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }}
@@ -959,7 +1002,7 @@ def _build_markdown_viewer_page(file_name: str, text: str) -> str:
 <body>
   <div class="topbar">
     <h1>{title}</h1>
-    <span class="badge">Markdown viewer</span>
+    {actions}
   </div>
   <main class="markdown-body">
     {body}
@@ -969,13 +1012,21 @@ def _build_markdown_viewer_page(file_name: str, text: str) -> str:
 """
 
 
-def _build_json_viewer_page(file_name: str, text: str) -> str:
+def _build_json_viewer_page(
+    file_name: str,
+    text: str,
+    *,
+    topbar_right_html: str = "",
+) -> str:
     title = html.escape(file_name)
     try:
         data = json.loads(text)
         pretty = html.escape(json.dumps(data, ensure_ascii=False, indent=2))
+        badge = "JSON viewer"
     except Exception:
         pretty = html.escape(text)
+        badge = "JSON viewer (invalid JSON — raw text)"
+    actions = topbar_right_html or f'<span class="badge">{html.escape(badge)}</span>'
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -983,14 +1034,143 @@ def _build_json_viewer_page(file_name: str, text: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
   <style>
-    body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-    .topbar {{ padding: 10px 20px; border-bottom: 1px solid #30363d; position: sticky; top: 0; background: rgba(13,17,23,0.92); }}
-    pre {{ margin: 0; padding: 20px; white-space: pre-wrap; word-break: break-word; }}
+    :root {{ color-scheme: light dark; }}
+    body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
+    .topbar {{
+      padding: 10px 20px; border-bottom: 1px solid #30363d; position: sticky; top: 0;
+      background: rgba(13,17,23,0.92); display: flex; justify-content: space-between; gap: 12px; align-items: center;
+    }}
+    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
+    .topbar-actions {{ display: flex; align-items: center; gap: 14px; }}
+    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; }}
+    .badge {{ font-size: 12px; color: #8b949e; }}
+    pre {{ margin: 0; padding: 20px; white-space: pre-wrap; word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }}
+    @media (prefers-color-scheme: light) {{
+      body {{ background: #ffffff; color: #1f2328; }}
+      .topbar {{ background: rgba(255,255,255,0.92); border-color: #d0d7de; }}
+    }}
   </style>
 </head>
 <body>
-  <div class="topbar"><strong>{title}</strong> · JSON viewer</div>
+  <div class="topbar">
+    <h1>{title}</h1>
+    {actions}
+  </div>
   <pre>{pretty}</pre>
+</body>
+</html>
+"""
+
+
+_CSV_MAX_PREVIEW_ROWS = 5000
+
+
+def _build_csv_viewer_page(
+    file_name: str,
+    text: str,
+    *,
+    topbar_right_html: str = "",
+    max_rows: int = _CSV_MAX_PREVIEW_ROWS,
+) -> str:
+    title = html.escape(file_name)
+    sample = text[:4096] if text else ""
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t|;")
+    except Exception:
+        dialect = csv.excel
+
+    rows: List[List[str]] = []
+    truncated = False
+    try:
+        reader = csv.reader(io.StringIO(text or ""), dialect)
+        for i, row in enumerate(reader):
+            if i >= max_rows:
+                truncated = True
+                break
+            rows.append([str(cell) for cell in row])
+        badge = f"CSV viewer · {len(rows)} rows"
+        if truncated:
+            badge += f" (first {max_rows} shown)"
+    except Exception:
+        body = f'<pre class="raw">{html.escape(text or "")}</pre>'
+        actions = topbar_right_html or '<span class="badge">CSV viewer (parse failed)</span>'
+        return _csv_shell(title, actions, body)
+
+    if not rows:
+        body = '<p class="empty">Empty CSV</p>'
+    elif len(rows) == 1:
+        body = (
+            "<table><tbody><tr>"
+            + "".join(f"<td>{html.escape(c)}</td>" for c in rows[0])
+            + "</tr></tbody></table>"
+        )
+    else:
+        header = rows[0]
+        thead = "".join(f"<th>{html.escape(c)}</th>" for c in header)
+        tbody_parts: List[str] = []
+        for row in rows[1:]:
+            cells = list(row) + [""] * max(0, len(header) - len(row))
+            cells = cells[: len(header)] if header else cells
+            tbody_parts.append(
+                "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
+            )
+        body = (
+            f"<table><thead><tr>{thead}</tr></thead>"
+            f"<tbody>{''.join(tbody_parts)}</tbody></table>"
+        )
+    badge_html = f'<span class="badge">{html.escape(badge)}</span>'
+    if topbar_right_html:
+        actions = (
+            f'<div class="topbar-actions">{badge_html}{topbar_right_html}</div>'
+        )
+    else:
+        actions = badge_html
+    return _csv_shell(title, actions, body)
+
+
+def _csv_shell(title: str, actions: str, body_inner: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
+    .topbar {{
+      position: sticky; top: 0; z-index: 2;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 20px; border-bottom: 1px solid #30363d;
+      background: rgba(13, 17, 23, 0.92); backdrop-filter: blur(8px);
+    }}
+    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .topbar-actions {{ display: flex; align-items: center; gap: 14px; flex-shrink: 0; }}
+    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap; }}
+    .badge {{ font-size: 12px; color: #8b949e; white-space: nowrap; }}
+    .wrap {{ box-sizing: border-box; max-width: 100%; margin: 0 auto; padding: 16px 12px 64px; overflow-x: auto; }}
+    table {{ border-collapse: collapse; width: max-content; min-width: 100%; font-size: 13px; }}
+    th, td {{ border: 1px solid #30363d; padding: 6px 10px; text-align: left; vertical-align: top; max-width: 420px; white-space: pre-wrap; word-break: break-word; }}
+    thead th {{ position: sticky; top: 52px; z-index: 1; background: #161b22; font-weight: 600; }}
+    tbody tr:nth-child(even) {{ background: rgba(110, 118, 129, 0.08); }}
+    p.empty {{ color: #8b949e; padding: 24px; }}
+    pre.raw {{ margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }}
+    @media (prefers-color-scheme: light) {{
+      body {{ background: #ffffff; color: #1f2328; }}
+      .topbar {{ background: rgba(255,255,255,0.92); border-color: #d0d7de; }}
+      th, td {{ border-color: #d0d7de; }}
+      thead th {{ background: #f6f8fa; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>{title}</h1>
+    {actions}
+  </div>
+  <div class="wrap">{body_inner}</div>
 </body>
 </html>
 """
@@ -1020,13 +1200,18 @@ def _redirect_response(location: str) -> Dict[str, Any]:
     }
 
 
-def _load_s3_text(key: str) -> str:
-    obj = _s3_client().get_object(Bucket=ESS_S3_BUCKET, Key=key)
+def _load_s3_text(key: str, *, bucket: Optional[str] = None) -> str:
+    use_bucket = (bucket or ESS_S3_BUCKET or "").strip()
+    if not use_bucket:
+        raise RuntimeError("S3 bucket is not configured")
+    obj = _s3_client().get_object(Bucket=use_bucket, Key=key)
     raw = obj["Body"].read()
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("utf-8", errors="replace")
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _doc_stub_from_filename(filename: str) -> Dict[str, Any]:
@@ -1045,6 +1230,14 @@ def _parse_document_view_path(parts: List[str]) -> Optional[Tuple[str, str, str]
     if not filename:
         return None
     return kind_key, filename, view
+
+
+def _download_href_for_key(event: Dict[str, Any], key: str) -> str:
+    qs = _access_token_qs(event)
+    href = f"/download?key={quote(key)}"
+    if qs:
+        href = f"{href}&{qs}"
+    return href
 
 
 def _handle_document_view(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]:
@@ -1076,7 +1269,18 @@ def _handle_document_view(event: Dict[str, Any], parts: List[str]) -> Dict[str, 
                 f"<html><body><h1>Markdown not found</h1><p>{html.escape(filename)}</p></body></html>",
             )
         text = _load_s3_text(key)
-        return _html_response(200, _build_markdown_viewer_page(key.rsplit("/", 1)[-1], text))
+        actions = _viewer_topbar_actions(
+            download_href=_download_href_for_key(event, key),
+            raw_href=(
+                f"{ESS_SHARING_URL}/{quote(key, safe='/')}" if ESS_SHARING_URL else ""
+            ),
+        )
+        return _html_response(
+            200,
+            _build_markdown_viewer_page(
+                key.rsplit("/", 1)[-1], text, topbar_right_html=actions
+            ),
+        )
 
     if view == "json":
         key = _find_object_key(user, stub, kind_key, suffixes=(".json",))
@@ -1091,7 +1295,18 @@ def _handle_document_view(event: Dict[str, Any], parts: List[str]) -> Dict[str, 
                 f"<html><body><h1>JSON not found</h1><p>{html.escape(filename)}</p></body></html>",
             )
         text = _load_s3_text(key)
-        return _html_response(200, _build_json_viewer_page(key.rsplit("/", 1)[-1], text))
+        actions = _viewer_topbar_actions(
+            download_href=_download_href_for_key(event, key),
+            raw_href=(
+                f"{ESS_SHARING_URL}/{quote(key, safe='/')}" if ESS_SHARING_URL else ""
+            ),
+        )
+        return _html_response(
+            200,
+            _build_json_viewer_page(
+                key.rsplit("/", 1)[-1], text, topbar_right_html=actions
+            ),
+        )
 
     if view == "pdf":
         key = _find_object_key(user, stub, kind_key, suffixes=(".pdf",))
@@ -1354,6 +1569,146 @@ def _rewrite_result_download_urls(text: str) -> Tuple[str, List[Dict[str, str]]]
     return body, out
 
 
+_ARTIFACT_VIEW_EXTENSIONS = {".md", ".markdown", ".json", ".csv"}
+
+
+def _sanitize_user_segment(user_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._\-]", "_", (user_id or "").strip()) or "user"
+
+
+def _normalize_artifact_rest(file_path: str, user_id: str) -> str:
+    raw = (file_path or "").strip().lstrip("/")
+    parts = [p for p in raw.replace("\\", "/").split("/") if p]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError("Invalid file path")
+    segment = _sanitize_user_segment(user_id)
+    if len(parts) >= 2 and parts[0] == "artifacts":
+        if parts[1] != segment:
+            raise PermissionError("Artifact access denied")
+        rest = "/".join(parts[2:])
+        if not rest:
+            raise ValueError("File path is required")
+        return rest
+    if parts[0] == segment:
+        rest = "/".join(parts[1:])
+        if not rest:
+            raise ValueError("File path is required")
+        return rest
+    return "/".join(parts)
+
+
+def _artifact_s3_key(user_id: str, file_path: str) -> Tuple[str, str]:
+    rest = _normalize_artifact_rest(file_path, user_id)
+    segment = _sanitize_user_segment(user_id)
+    key = f"artifacts/{segment}/{rest}"
+    return key, rest.rsplit("/", 1)[-1]
+
+
+def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]:
+    """GET /artifacts/view|download/{file_path+} for shared md/json/csv."""
+    if len(parts) < 3 or parts[0] != "artifacts" or parts[1] not in {"view", "download"}:
+        return _response(404, {"error": "Not found"})
+    action = parts[1]
+    file_path = unquote("/".join(parts[2:])).strip()
+    try:
+        user = _require_user(event)
+    except PermissionError as e:
+        if action == "view":
+            return _html_response(
+                401,
+                f"<html><body><h1>Unauthorized</h1><p>{html.escape(str(e))}</p></body></html>",
+            )
+        return _response(401, {"error": str(e)})
+
+    try:
+        s3_key, file_name = _artifact_s3_key(user, file_path)
+    except PermissionError as e:
+        return _response(403, {"error": str(e)})
+    except ValueError as e:
+        return _response(400, {"error": str(e)})
+
+    ext = os.path.splitext(file_name.lower())[1]
+    if ext not in _ARTIFACT_VIEW_EXTENSIONS:
+        return _response(
+            400, {"error": "Viewer supports .md / .markdown / .json / .csv only"}
+        )
+
+    bucket = (S3_BUCKET or "").strip()
+    if not bucket:
+        return _response(500, {"error": "S3_BUCKET is not configured"})
+    if not _object_exists(bucket, s3_key):
+        return _response(404, {"error": f"Artifact not found: {s3_key}"})
+
+    if action == "download":
+        media = (
+            "application/json; charset=utf-8"
+            if ext == ".json"
+            else (
+                "text/csv; charset=utf-8"
+                if ext == ".csv"
+                else "text/markdown; charset=utf-8"
+            )
+        )
+        url = _presign(
+            bucket,
+            s3_key,
+            expires=6 * 3600,
+            inline=False,
+            content_type=media,
+            download_name=file_name,
+        )
+        if not url:
+            return _response(502, {"error": "Could not create download URL"})
+        return _redirect_response(url)
+
+    try:
+        text = _load_s3_text(s3_key, bucket=bucket)
+    except Exception as e:
+        logger.exception("Failed to load artifact %s", s3_key)
+        return _html_response(
+            502,
+            f"<html><body><h1>Failed to load artifact</h1>"
+            f"<p>{html.escape(str(e))}</p></body></html>",
+        )
+
+    qs = _access_token_qs(event)
+    encoded_rest = quote(_normalize_artifact_rest(file_path, user), safe="/")
+    download_href = f"/artifacts/download/{encoded_rest}"
+    if qs:
+        download_href = f"{download_href}?{qs}"
+    raw_href = f"{SHARING_URL}/{quote(s3_key, safe='/')}" if SHARING_URL else ""
+    link_html = "".join(
+        [
+            f'<a class="action" href="{html.escape(download_href, quote=True)}">Download</a>',
+            (
+                f'<a class="action" href="{html.escape(raw_href, quote=True)}" '
+                f'target="_blank" rel="noopener noreferrer">Raw</a>'
+                if raw_href
+                else ""
+            ),
+        ]
+    )
+    if ext == ".csv":
+        page = _build_csv_viewer_page(file_name, text, topbar_right_html=link_html)
+    elif ext == ".json":
+        page = _build_json_viewer_page(
+            file_name,
+            text,
+            topbar_right_html=_viewer_topbar_actions(
+                download_href=download_href, raw_href=raw_href
+            ),
+        )
+    else:
+        page = _build_markdown_viewer_page(
+            file_name,
+            text,
+            topbar_right_html=_viewer_topbar_actions(
+                download_href=download_href, raw_href=raw_href
+            ),
+        )
+    return _html_response(200, page)
+
+
 def _handle_download(event: Dict[str, Any]) -> Dict[str, Any]:
     """GET /download?key=artifacts/... → 302 to region-correct presigned URL."""
     try:
@@ -1377,21 +1732,26 @@ def _handle_download(event: Dict[str, Any]) -> Dict[str, Any]:
 
     name = key.rsplit("/", 1)[-1]
     lower = name.lower()
-    inline = lower.endswith((".pdf", ".md", ".markdown", ".json"))
+    inline = lower.endswith(".pdf")
+    content_type = None
+    if lower.endswith(".pdf"):
+        content_type = "application/pdf"
+    elif lower.endswith((".xlsx", ".xlsm")):
+        content_type = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    elif lower.endswith(".json"):
+        content_type = "application/json; charset=utf-8"
+    elif lower.endswith(".csv"):
+        content_type = "text/csv; charset=utf-8"
+    elif lower.endswith((".md", ".markdown")):
+        content_type = "text/markdown; charset=utf-8"
     url = _presign(
         bucket,
         key,
         expires=6 * 3600,
         inline=inline,
-        content_type=(
-            "application/pdf"
-            if lower.endswith(".pdf")
-            else (
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                if lower.endswith((".xlsx", ".xlsm"))
-                else None
-            )
-        ),
+        content_type=content_type,
         download_name=name,
     )
     if not url:
@@ -1625,6 +1985,9 @@ def handler(event, context):
 
     if method == "GET" and parts and parts[0] == "download":
         return _handle_download(event)
+
+    if method == "GET" and parts and parts[0] == "artifacts":
+        return _handle_artifacts(event, parts)
 
     if method == "GET" and parts and parts[0] == "documents":
         return _handle_documents(event, path)
