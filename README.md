@@ -182,4 +182,6 @@ python3 uninstaller.py --region us-west-2 --debug
 
 <img width="1100" height="232" alt="image" src="https://github.com/user-attachments/assets/58afcfe8-a496-4e71-ad31-310975a8d6c0" />
 
-이때의 결과는 아래와 같습니다.
+이때의 결과는 아래와 같습니다. 결과분석으로 얻어진 파일을 다운로드 할 수 있습니다.
+
+<img width="1103" height="419" alt="image" src="https://github.com/user-attachments/assets/bae866e2-50a4-4345-b7b5-149f25f2cae4" />
