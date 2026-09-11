@@ -167,3 +167,18 @@ python3 uninstaller.py --region us-west-2 --debug
 - 긴 분석은 `POST /jobs` + Event worker(LMI, 최대 30분) + `GET /jobs/{jobId}` 폴링입니다. 자세한 내용은 [비동기 처리](#비동기-처리)를 보세요.
 - HTTP API CORS가 OPTIONS preflight를 처리합니다 (Lambda OPTIONS 라우트 없음).
 - LMI capacity provider는 EC2 인스턴스를 띄우므로, 사용 후 `uninstaller.py`로 정리하는 것을 권장합니다.
+
+## 실행 결과
+
+아래와 같이 로그인을 수행합니다.
+
+<img width="1100" height="478" alt="image" src="https://github.com/user-attachments/assets/b1a2ee10-b84b-481a-a541-c2947e91e9b4" />
+
+이제 아래와 같이 문서를 선택합니다.
+
+<img width="1103" height="362" alt="image" src="https://github.com/user-attachments/assets/47645b0d-c018-4ec5-8ad6-06e3816b04b5" />
+
+아래와 같이 분서 분석을 요청합니다.
+
+<img width="1100" height="232" alt="image" src="https://github.com/user-attachments/assets/58afcfe8-a496-4e71-ad31-310975a8d6c0" />
+
