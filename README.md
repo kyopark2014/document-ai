@@ -178,7 +178,8 @@ python3 uninstaller.py --region us-west-2 --debug
 
 <img width="1103" height="362" alt="image" src="https://github.com/user-attachments/assets/47645b0d-c018-4ec5-8ad6-06e3816b04b5" />
 
-아래와 같이 분서 분석을 요청합니다.
+아래와 같이 문서 분석을 요청합니다.
 
 <img width="1100" height="232" alt="image" src="https://github.com/user-attachments/assets/58afcfe8-a496-4e71-ad31-310975a8d6c0" />
 
+이때의 결과는 아래와 같습니다.
