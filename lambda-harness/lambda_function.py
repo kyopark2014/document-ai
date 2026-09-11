@@ -17,9 +17,10 @@ Internal (async Event invoke):
 
 from __future__ import annotations
 
+import base64
+import csv
 import html
 import io
-import csv
 import json
 import logging
 import os
@@ -634,8 +635,11 @@ def _presign(
         params: Dict[str, Any] = {"Bucket": bucket, "Key": key}
         name = download_name or key.rsplit("/", 1)[-1]
         safe_name = name.replace('"', "")
+        # Always set disposition so browsers download (attachment) vs preview (inline).
         if inline:
             params["ResponseContentDisposition"] = f'inline; filename="{safe_name}"'
+        else:
+            params["ResponseContentDisposition"] = f'attachment; filename="{safe_name}"'
         if content_type:
             params["ResponseContentType"] = content_type
         return _s3_client().generate_presigned_url(
@@ -646,6 +650,32 @@ def _presign(
     except Exception as e:
         logger.debug("presign failed %s/%s: %s", bucket, key, e)
         return None
+
+
+def _attachment_response(
+    data: bytes, file_name: str, media_type: str
+) -> Dict[str, Any]:
+    """Stream a file download through API Gateway (harness-work style)."""
+    safe_name = (file_name or "download").replace('"', "")
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Content-Type": media_type,
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+        },
+        "body": base64.b64encode(data).decode("ascii"),
+        "isBase64Encoded": True,
+    }
+
+
+def _load_s3_bytes(key: str, *, bucket: Optional[str] = None) -> bytes:
+    use_bucket = (bucket or ESS_S3_BUCKET or S3_BUCKET or "").strip()
+    if not use_bucket:
+        raise RuntimeError("S3 bucket is not configured")
+    obj = _s3_client().get_object(Bucket=use_bucket, Key=key)
+    return obj["Body"].read()
 
 
 def _sharing_url_for_key(key: str) -> Optional[str]:
@@ -926,6 +956,7 @@ def _viewer_topbar_actions(
     download_href: str = "",
     raw_href: str = "",
 ) -> str:
+    """Bare action links (shell wraps them in .topbar-actions — harness style)."""
     parts: List[str] = []
     if download_href:
         parts.append(
@@ -936,9 +967,7 @@ def _viewer_topbar_actions(
             f'<a class="action" href="{html.escape(raw_href, quote=True)}" '
             f'target="_blank" rel="noopener noreferrer">Raw</a>'
         )
-    if not parts:
-        return ""
-    return '<div class="topbar-actions">' + "".join(parts) + "</div>"
+    return "".join(parts)
 
 
 def _access_token_qs(event: Dict[str, Any]) -> str:
@@ -951,15 +980,92 @@ def _access_token_qs(event: Dict[str, Any]) -> str:
     return f"access_token={quote(token)}"
 
 
+def markdown_to_safe_html(text: str) -> str:
+    """Best-effort Markdown → HTML without client JS (CSP-safe)."""
+    try:
+        import markdown as md_lib  # type: ignore
+
+        return md_lib.markdown(
+            text,
+            extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
+            output_format="html5",
+        )
+    except Exception:
+        return _simple_markdown_to_html(text)
+
+
+_MARKDOWN_BODY_CSS = """
+    .markdown-body {
+      background: transparent;
+      color: #e6edf3;
+      line-height: 1.6;
+      font-size: 15px;
+    }
+    .markdown-body h1, .markdown-body h2, .markdown-body h3 {
+      margin: 1.2em 0 0.5em;
+      font-weight: 650;
+      border-bottom: 1px solid #30363d;
+      padding-bottom: 0.3em;
+    }
+    .markdown-body p { margin: 0.75em 0; }
+    .markdown-body ul, .markdown-body ol { padding-left: 1.5em; }
+    .markdown-body code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.9em;
+      background: rgba(110, 118, 129, 0.2);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+    }
+    .markdown-body pre {
+      overflow-x: auto;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: rgba(110, 118, 129, 0.15);
+      border: 1px solid #30363d;
+    }
+    .markdown-body pre code {
+      background: transparent;
+      padding: 0;
+    }
+    .markdown-body table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1em 0;
+      font-size: 14px;
+    }
+    .markdown-body th, .markdown-body td {
+      border: 1px solid #30363d;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .markdown-body a { color: #58a6ff; }
+    .markdown-body blockquote {
+      margin: 0.75em 0;
+      padding: 0 1em;
+      border-left: 3px solid #30363d;
+      color: #8b949e;
+    }
+    @media (prefers-color-scheme: light) {
+      .markdown-body { color: #1f2328; }
+      .markdown-body h1, .markdown-body h2, .markdown-body h3,
+      .markdown-body th, .markdown-body td,
+      .markdown-body pre, .markdown-body blockquote {
+        border-color: #d0d7de;
+      }
+      .markdown-body blockquote { color: #656d76; }
+    }
+"""
+
+
 def _build_markdown_viewer_page(
     file_name: str,
     text: str,
     *,
     topbar_right_html: str = "",
 ) -> str:
+    """Full HTML document for markdown preview (CSP-safe, harness-work style)."""
     title = html.escape(file_name)
-    body = _simple_markdown_to_html(text)
-    actions = topbar_right_html or '<span class="badge">Markdown viewer</span>'
+    body_inner = markdown_to_safe_html(text)
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -982,31 +1088,38 @@ def _build_markdown_viewer_page(
       background: rgba(13, 17, 23, 0.92);
       backdrop-filter: blur(8px);
     }}
-    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .topbar-actions {{ display: flex; align-items: center; gap: 14px; flex-shrink: 0; }}
-    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap; }}
-    .badge {{ font-size: 12px; color: #8b949e; }}
-    main {{ max-width: 920px; margin: 0 auto; padding: 24px 20px 64px; line-height: 1.65; }}
-    main h1, main h2, main h3, main h4 {{ border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }}
-    main code {{ background: rgba(110,118,129,0.2); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em; }}
-    main pre {{ overflow-x: auto; padding: 12px 14px; border-radius: 8px; background: rgba(110,118,129,0.15); border: 1px solid #30363d; }}
-    main pre code {{ background: none; padding: 0; }}
-    main a {{ color: #58a6ff; }}
+    .topbar h1 {{
+      margin: 0; font-size: 14px; font-weight: 600;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }}
+    .topbar-actions {{
+      display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+    }}
+    .topbar a.action {{
+      color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap;
+    }}
+    .topbar a.action:hover {{ text-decoration: underline; }}
+    .wrap {{
+      box-sizing: border-box;
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px 20px 64px;
+    }}
+    {_MARKDOWN_BODY_CSS}
     @media (prefers-color-scheme: light) {{
       body {{ background: #ffffff; color: #1f2328; }}
-      .topbar {{ background: rgba(255,255,255,0.92); border-color: #d0d7de; }}
-      main h1, main h2, main h3, main h4, main pre {{ border-color: #d0d7de; }}
+      .topbar {{ background: rgba(255,255,255,0.92); border-bottom-color: #d0d7de; }}
     }}
   </style>
 </head>
 <body>
   <div class="topbar">
     <h1>{title}</h1>
-    {actions}
+    <div class="topbar-actions">{topbar_right_html}</div>
   </div>
-  <main class="markdown-body">
-    {body}
-  </main>
+  <div class="wrap">
+    <article class="markdown-body">{body_inner}</article>
+  </div>
 </body>
 </html>
 """
@@ -1018,6 +1131,7 @@ def _build_json_viewer_page(
     *,
     topbar_right_html: str = "",
 ) -> str:
+    """Full HTML document for JSON preview (pretty-printed, CSP-safe)."""
     title = html.escape(file_name)
     try:
         data = json.loads(text)
@@ -1026,7 +1140,6 @@ def _build_json_viewer_page(
     except Exception:
         pretty = html.escape(text)
         badge = "JSON viewer (invalid JSON — raw text)"
-    actions = topbar_right_html or f'<span class="badge">{html.escape(badge)}</span>'
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1035,30 +1148,70 @@ def _build_json_viewer_page(
   <title>{title}</title>
   <style>
     :root {{ color-scheme: light dark; }}
-    body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
-    .topbar {{
-      padding: 10px 20px; border-bottom: 1px solid #30363d; position: sticky; top: 0;
-      background: rgba(13,17,23,0.92); display: flex; justify-content: space-between; gap: 12px; align-items: center;
+    body {{
+      margin: 0;
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     }}
-    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
-    .topbar-actions {{ display: flex; align-items: center; gap: 14px; }}
-    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; }}
-    .badge {{ font-size: 12px; color: #8b949e; }}
-    pre {{ margin: 0; padding: 20px; white-space: pre-wrap; word-break: break-word;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }}
+    .topbar {{
+      position: sticky; top: 0; z-index: 2;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 20px;
+      border-bottom: 1px solid #30363d;
+      background: rgba(13, 17, 23, 0.92);
+      backdrop-filter: blur(8px);
+    }}
+    .topbar h1 {{
+      margin: 0; font-size: 14px; font-weight: 600;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }}
+    .topbar-actions {{
+      display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+    }}
+    .topbar a.action {{
+      color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap;
+    }}
+    .topbar a.action:hover {{ text-decoration: underline; }}
+    .badge {{
+      font-size: 12px; color: #8b949e; margin-right: 4px; white-space: nowrap;
+    }}
+    .wrap {{
+      box-sizing: border-box;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 20px 16px 64px;
+    }}
+    pre.json {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      padding: 16px 18px;
+      border-radius: 8px;
+      background: rgba(110, 118, 129, 0.12);
+      border: 1px solid #30363d;
+    }}
     @media (prefers-color-scheme: light) {{
       body {{ background: #ffffff; color: #1f2328; }}
-      .topbar {{ background: rgba(255,255,255,0.92); border-color: #d0d7de; }}
+      .topbar {{ background: rgba(255,255,255,0.92); border-bottom-color: #d0d7de; }}
+      pre.json {{ border-color: #d0d7de; background: rgba(175, 184, 193, 0.12); }}
     }}
   </style>
 </head>
 <body>
   <div class="topbar">
     <h1>{title}</h1>
-    {actions}
+    <div class="topbar-actions">
+      <span class="badge">{html.escape(badge)}</span>
+      {topbar_right_html}
+    </div>
   </div>
-  <pre>{pretty}</pre>
+  <div class="wrap">
+    <pre class="json">{pretty}</pre>
+  </div>
 </body>
 </html>
 """
@@ -1074,6 +1227,7 @@ def _build_csv_viewer_page(
     topbar_right_html: str = "",
     max_rows: int = _CSV_MAX_PREVIEW_ROWS,
 ) -> str:
+    """Full HTML document for CSV preview as a table (CSP-safe)."""
     title = html.escape(file_name)
     sample = text[:4096] if text else ""
     try:
@@ -1095,42 +1249,41 @@ def _build_csv_viewer_page(
             badge += f" (first {max_rows} shown)"
     except Exception:
         body = f'<pre class="raw">{html.escape(text or "")}</pre>'
-        actions = topbar_right_html or '<span class="badge">CSV viewer (parse failed)</span>'
-        return _csv_shell(title, actions, body)
+        return _csv_shell(
+            title, "CSV viewer (parse failed — raw text)", topbar_right_html, body
+        )
 
     if not rows:
         body = '<p class="empty">Empty CSV</p>'
-    elif len(rows) == 1:
+        return _csv_shell(title, badge, topbar_right_html, body)
+
+    header = rows[0]
+    body_rows = rows[1:] if len(rows) > 1 else []
+    thead = "".join(f"<th>{html.escape(c)}</th>" for c in header)
+    tbody_parts: List[str] = []
+    for row in body_rows:
+        cells = list(row) + [""] * max(0, len(header) - len(row))
+        cells = cells[: len(header)] if header else cells
+        tbody_parts.append(
+            "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
+        )
+    if len(rows) == 1:
         body = (
             "<table><tbody><tr>"
-            + "".join(f"<td>{html.escape(c)}</td>" for c in rows[0])
+            + "".join(f"<td>{html.escape(c)}</td>" for c in header)
             + "</tr></tbody></table>"
         )
     else:
-        header = rows[0]
-        thead = "".join(f"<th>{html.escape(c)}</th>" for c in header)
-        tbody_parts: List[str] = []
-        for row in rows[1:]:
-            cells = list(row) + [""] * max(0, len(header) - len(row))
-            cells = cells[: len(header)] if header else cells
-            tbody_parts.append(
-                "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
-            )
         body = (
             f"<table><thead><tr>{thead}</tr></thead>"
             f"<tbody>{''.join(tbody_parts)}</tbody></table>"
         )
-    badge_html = f'<span class="badge">{html.escape(badge)}</span>'
-    if topbar_right_html:
-        actions = (
-            f'<div class="topbar-actions">{badge_html}{topbar_right_html}</div>'
-        )
-    else:
-        actions = badge_html
-    return _csv_shell(title, actions, body)
+    return _csv_shell(title, badge, topbar_right_html, body)
 
 
-def _csv_shell(title: str, actions: str, body_inner: str) -> str:
+def _csv_shell(
+    title: str, badge: str, topbar_right_html: str, body_inner: str
+) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1139,27 +1292,70 @@ def _csv_shell(title: str, actions: str, body_inner: str) -> str:
   <title>{title}</title>
   <style>
     :root {{ color-scheme: light dark; }}
-    body {{ margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }}
+    body {{
+      margin: 0;
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }}
     .topbar {{
       position: sticky; top: 0; z-index: 2;
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      padding: 10px 20px; border-bottom: 1px solid #30363d;
-      background: rgba(13, 17, 23, 0.92); backdrop-filter: blur(8px);
+      padding: 10px 20px;
+      border-bottom: 1px solid #30363d;
+      background: rgba(13, 17, 23, 0.92);
+      backdrop-filter: blur(8px);
     }}
-    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .topbar-actions {{ display: flex; align-items: center; gap: 14px; flex-shrink: 0; }}
-    .topbar a.action {{ color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap; }}
-    .badge {{ font-size: 12px; color: #8b949e; white-space: nowrap; }}
-    .wrap {{ box-sizing: border-box; max-width: 100%; margin: 0 auto; padding: 16px 12px 64px; overflow-x: auto; }}
-    table {{ border-collapse: collapse; width: max-content; min-width: 100%; font-size: 13px; }}
-    th, td {{ border: 1px solid #30363d; padding: 6px 10px; text-align: left; vertical-align: top; max-width: 420px; white-space: pre-wrap; word-break: break-word; }}
-    thead th {{ position: sticky; top: 52px; z-index: 1; background: #161b22; font-weight: 600; }}
+    .topbar h1 {{
+      margin: 0; font-size: 14px; font-weight: 600;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }}
+    .topbar-actions {{
+      display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+    }}
+    .topbar a.action {{
+      color: #58a6ff; text-decoration: none; font-size: 13px; white-space: nowrap;
+    }}
+    .topbar a.action:hover {{ text-decoration: underline; }}
+    .badge {{
+      font-size: 12px; color: #8b949e; margin-right: 4px; white-space: nowrap;
+    }}
+    .wrap {{
+      box-sizing: border-box;
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 16px 12px 64px;
+      overflow-x: auto;
+    }}
+    table {{
+      border-collapse: collapse;
+      width: max-content;
+      min-width: 100%;
+      font-size: 13px;
+    }}
+    th, td {{
+      border: 1px solid #30363d;
+      padding: 6px 10px;
+      text-align: left;
+      vertical-align: top;
+      max-width: 420px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+    thead th {{
+      position: sticky; top: 52px; z-index: 1;
+      background: #161b22;
+      font-weight: 600;
+    }}
     tbody tr:nth-child(even) {{ background: rgba(110, 118, 129, 0.08); }}
     p.empty {{ color: #8b949e; padding: 24px; }}
-    pre.raw {{ margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }}
+    pre.raw {{
+      margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+    }}
     @media (prefers-color-scheme: light) {{
       body {{ background: #ffffff; color: #1f2328; }}
-      .topbar {{ background: rgba(255,255,255,0.92); border-color: #d0d7de; }}
+      .topbar {{ background: rgba(255,255,255,0.92); border-bottom-color: #d0d7de; }}
       th, td {{ border-color: #d0d7de; }}
       thead th {{ background: #f6f8fa; }}
     }}
@@ -1168,9 +1364,14 @@ def _csv_shell(title: str, actions: str, body_inner: str) -> str:
 <body>
   <div class="topbar">
     <h1>{title}</h1>
-    {actions}
+    <div class="topbar-actions">
+      <span class="badge">{html.escape(badge)}</span>
+      {topbar_right_html}
+    </div>
   </div>
-  <div class="wrap">{body_inner}</div>
+  <div class="wrap">
+    {body_inner}
+  </div>
 </body>
 </html>
 """
@@ -1649,17 +1850,12 @@ def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]
                 else "text/markdown; charset=utf-8"
             )
         )
-        url = _presign(
-            bucket,
-            s3_key,
-            expires=6 * 3600,
-            inline=False,
-            content_type=media,
-            download_name=file_name,
-        )
-        if not url:
-            return _response(502, {"error": "Could not create download URL"})
-        return _redirect_response(url)
+        try:
+            data = _load_s3_bytes(s3_key, bucket=bucket)
+        except Exception:
+            logger.exception("Failed to download artifact %s", s3_key)
+            return _response(502, {"error": "Failed to read artifact from S3"})
+        return _attachment_response(data, file_name, media)
 
     try:
         text = _load_s3_text(s3_key, bucket=bucket)
@@ -1677,35 +1873,13 @@ def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]
     if qs:
         download_href = f"{download_href}?{qs}"
     raw_href = f"{SHARING_URL}/{quote(s3_key, safe='/')}" if SHARING_URL else ""
-    link_html = "".join(
-        [
-            f'<a class="action" href="{html.escape(download_href, quote=True)}">Download</a>',
-            (
-                f'<a class="action" href="{html.escape(raw_href, quote=True)}" '
-                f'target="_blank" rel="noopener noreferrer">Raw</a>'
-                if raw_href
-                else ""
-            ),
-        ]
-    )
+    actions = _viewer_topbar_actions(download_href=download_href, raw_href=raw_href)
     if ext == ".csv":
-        page = _build_csv_viewer_page(file_name, text, topbar_right_html=link_html)
+        page = _build_csv_viewer_page(file_name, text, topbar_right_html=actions)
     elif ext == ".json":
-        page = _build_json_viewer_page(
-            file_name,
-            text,
-            topbar_right_html=_viewer_topbar_actions(
-                download_href=download_href, raw_href=raw_href
-            ),
-        )
+        page = _build_json_viewer_page(file_name, text, topbar_right_html=actions)
     else:
-        page = _build_markdown_viewer_page(
-            file_name,
-            text,
-            topbar_right_html=_viewer_topbar_actions(
-                download_href=download_href, raw_href=raw_href
-            ),
-        )
+        page = _build_markdown_viewer_page(file_name, text, topbar_right_html=actions)
     return _html_response(200, page)
 
 

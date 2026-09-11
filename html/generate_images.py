@@ -38,7 +38,7 @@ VALID_ASPECT_RATIOS = [
 ]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGES_DIR = os.path.join(SCRIPT_DIR, "images")
+IMAGES_DIR = os.path.join(SCRIPT_DIR, "assets")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -259,7 +259,7 @@ def main() -> int:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
         f.write("\n")
     logger.info("Wrote %s", manifest_path)
-    logger.info("Done. Use images/hero-1.png … hero-5.png in the webpage 2x2 grid.")
+    logger.info("Done. Use assets/hero-1.png … hero-5.png in the webpage 2x2 grid.")
     return 0
 
 

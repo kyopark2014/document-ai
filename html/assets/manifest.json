@@ -4,28 +4,28 @@
   "images": [
     {
       "filename": "hero-1.png",
-      "path": "/Users/ksdyb/Documents/src/document-ai/html/images/hero-1.png",
+      "path": "/Users/ksdyb/Documents/src/document-ai/html/assets/hero-1.png",
       "seed": 20260921,
       "bytes": 1494690,
       "status": "ok"
     },
     {
       "filename": "hero-2.png",
-      "path": "/Users/ksdyb/Documents/src/document-ai/html/images/hero-2.png",
+      "path": "/Users/ksdyb/Documents/src/document-ai/html/assets/hero-2.png",
       "seed": 20260922,
       "bytes": 1654622,
       "status": "ok"
     },
     {
       "filename": "hero-3.png",
-      "path": "/Users/ksdyb/Documents/src/document-ai/html/images/hero-3.png",
+      "path": "/Users/ksdyb/Documents/src/document-ai/html/assets/hero-3.png",
       "seed": 20260923,
       "bytes": 1436378,
       "status": "ok"
     },
     {
       "filename": "hero-4.png",
-      "path": "/Users/ksdyb/Documents/src/document-ai/html/images/hero-4.png",
+      "path": "/Users/ksdyb/Documents/src/document-ai/html/assets/hero-4.png",
       "seed": 20260924,
       "bytes": 1622759,
       "status": "ok"
