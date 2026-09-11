@@ -1,0 +1,228 @@
+---
+name: testcase-generator
+description: >
+  Markdown 규격/표준 문서 경로를 받아 합격·불합격 판정용 Excel 테스트케이스(.xlsx)를 생성한다.
+  열: 규격명, 항목, 원문, 기준, 판정결과(합격/불합격/부분합격 선택), 비고.
+  초안은 S3 `artifacts/{project}/{user}/tc/`에 업로드하고 CloudFront URL을 반환한다.
+  사용자가 「저장」을 확인하면 `ess/test_cases/`에 영구 저장하고 `test_cases_list.json`을 갱신한다.
+  트리거: testcase-generator, 테스트케이스, test case, 엑셀 체크리스트,
+  ESS Regulations에서 복사한 md 경로로 TC 생성, NFPA/UL 규격 합격불합격 표, 테스트케이스 저장.
+---
+
+# testcase-generator
+
+Markdown 규격 문서에서 **검증 가능한 요구사항**을 추출해 Excel 테스트케이스를 만든다.
+
+## 필수 출력 열
+
+| 열 | 의미 | 규칙 |
+|----|------|------|
+| **규격명** | 표준 이름 (예: `NFPA 855 (2023)`, `UL 9540 (2025)`) | 문서 표제·연도 기준. 행마다 동일해도 각 행에 기입 |
+| **항목** | 조항 번호만 (예: `1.3`, `4.2.1.1`, `Table 1.3`) | 규격명을 넣지 않음 |
+| **원문** | 참고한 규격 텍스트 | **축약·요약 금지.** 해당 조항 본문을 그대로 옮긴다 |
+| **기준** | 합격/불합격/부분합격을 판단할 기준 | **원문 조항을 바탕으로** 판정자가 문서·도면·현장에서 **무엇을 확인할지** 구체적으로 서술. `~인지 확인`, `~이 충족되는지 확인` 형태 권장. 원문에 (1)(2)… 하위 목록이 있으면 번호 범위를 명시 (예: `(1)~(8)`) |
+| **판정결과** | Excel 드롭다운 | `합격` / `불합격` / `부분합격` 선택. 생성 시 비움 |
+| **비고** | 메모 | 생성 시 비움. 특이사항·근거 문서 링크 등 |
+
+## 에이전트 워크플로우
+
+### 1. 입력 확인
+
+사용자가 준 **markdown 파일 절대/상대 경로**를 확인한다.
+(ESS Regulations의 **복사**로 얻은 `md_path` / `md_workspace_path`를 그대로 써도 된다.)
+
+**경로 우선순위 (중요 — CloudFront URL 사용 금지):**
+
+1. **`/mnt/workspace/{user}/artifacts/md/{stem}.md`** — ESS Sync 후 Runtime workspace 미러 (권장)
+2. **`/mnt/workspace/{user}/ess/out/converted/{stem}.md`** — converted ESS markdown
+3. **`/mnt/workspace/{user}/ess/regulations/{stem}.md`** — regulations 폴더 원본 md
+4. S3 직접: `boto3` / `aws s3 cp`로 `artifacts/{project}/{user}/md/{stem}.md` 다운로드
+
+**하지 말 것:**
+
+- `get_raw_text` / `get_markdown`에 CloudFront URL 넣기 (403·Playwright 오류)
+- ECS 전용 경로(`/mnt/app-data/...`)를 Runtime에서 직접 읽기
+
+```bash
+# 예 (Runtime workspace)
+/mnt/workspace/ksdyb/artifacts/md/NFPA855_2023.md
+/mnt/workspace/ksdyb/ess/out/converted/s9540_3_2025_1.md
+```
+
+파일이 없으면 `read_file` / `bash ls`로 위 경로를 확인한 뒤, S3에서 workspace로 복사한다.
+
+### 2. Markdown 읽기 & 테스트케이스 추출
+
+`read_file` 또는 `bash`로 본문을 읽고, **의무 조항(shall / 필수 / 요구)** 중심으로 행을 만든다.
+
+추출 규칙:
+
+1. 문서에서 **규격명(`standard`)**을 먼저 확정한다. 예: `NFPA 855 (2023)`.
+2. 조항 번호가 있는 요구사항마다 **1행**. **항목**에는 조항 번호만 (`4.2.1.1`), **규격명**은 별도 열.
+3. **원문**은 해당 조항 텍스트를 **생략 없이** 복사한다. (`…`, `등`, 임의 요약 금지)
+4. 목록·하위 (1)(2)(3)이 있으면 원문에 모두 포함하거나, 하위가 독립 검증이면 별도 행(`4.2.1.1(1)` 등)으로 분리한다.
+5. **기준**은 원문의 요구사항을 **검증 가능한 확인 절차**로 풀어 쓴다. 추상적 서술(예: `요구사항 충족`, `규격 준수`)은 금지하고, 아래 원칙을 따른다.
+   - **대상·행위·근거**를 원문에서 그대로 가져온다. (예: `ESS 설치·교체·커미셔닝·사용`, `AHJ`, `도면·시방서`)
+   - **확인 동사**로 끝낸다. (예: `…제출·승인되었는지 확인`, `…누락 없이 포함되어 있는지 확인`)
+   - 원문에 **번호 목록 (1)(2)…** 이 있으면 범위를 명시한다. (예: `(1)~(8) 항목`, `(a)~(d) 항목`)
+   - 수치·한도가 있으면 기준에 포함한다. (예: `간격 900 mm 이상`, `온도 45 °C 이하`)
+   - **좋은 예:** `ESS 설치·교체·커미셔닝·사용 관련 도면·시방서가 AHJ에 제출·승인되었고, (1)~(8) 항목이 누락 없이 포함되어 있는지 확인`
+   - **나쁜 예:** `도면·시방서가 요구사항을 충족함`, `AHJ 승인 완료`
+6. **판정결과**·**비고**는 비워 둔다 (엑셀에서 사용자가 선택·기입).
+7. 서문·저작권·목차·정의만 나열된 비검증 문장은 제외한다. (정의 조항이 설치 의무를 포함하면 포함)
+8. 문서가 매우 길면 사용자가 지정한 장/절을 우선하고, 범위 미지정 시 Chapter/주요 Construction·Performance 요구부터 추출한 뒤 행 수를 보고한다. **한 번의 LLM 호출로 전체 문서를 처리하지 말고**, 장/절 단위로 cases JSON을 나눠 작성한 뒤 병합한다.
+
+JSON 초안을 `ARTIFACTS_DIR/tc/` 아래에 저장한다.
+
+```json
+{
+  "source_md": "/absolute/path/to/doc.md",
+  "title": "NFPA 855 2023 Test Cases",
+  "standard": "NFPA 855 (2023)",
+  "cases": [
+    {
+      "규격명": "NFPA 855 (2023)",
+      "항목": "4.2.1.1",
+      "원문": "The plans and specifications associated with an ESS ... shall be submitted to the AHJ for approval and include the following: ...",
+      "기준": "ESS 설치·교체·커미셔닝·사용 관련 도면·시방서가 AHJ에 제출·승인되었고, (1)~(8) 항목이 누락 없이 포함되어 있는지 확인",
+      "판정결과": "",
+      "비고": ""
+    }
+  ]
+}
+```
+
+행에 `규격명`이 없으면 루트 `"standard"` 값이 채워진다. 예전에 `항목`에 규격명이 붙어 있어도 스크립트가 분리한다.
+
+### 3. Excel 생성 + S3 업로드 (초안)
+
+`application` 디렉터리에서 번들 스크립트를 실행한다.
+
+```bash
+cd application
+python skills/testcase-generator/scripts/generate_testcase_xlsx.py \
+  --cases "$ARTIFACTS_DIR/tc/<stem>_cases.json" \
+  --user "<user_id>"
+```
+
+| 인자 | 설명 |
+|------|------|
+| `--cases` | 위 JSON 경로 (**필수**) |
+| `--user` | S3 경로의 user segment (세션 user_id) |
+| `--output-name` | 선택. 기본: `{md_stem}_testcase.xlsx` |
+| `--local-only` | S3 업로드 생략 (디버그용) |
+
+스크립트는:
+
+1. openpyxl로 `.xlsx` 작성 (시트명 `TestCases`, 열 순서 위 표와 동일)
+2. **판정결과** 열에 `합격` / `불합격` / `부분합격` 드롭다운(Data Validation) 적용
+3. 로컬 초안: `{SESSION_STORAGE}/{user}/artifacts/tc/{filename}.xlsx`
+4. S3 업로드 키: **`artifacts/{projectName}/{user}/tc/{filename}.xlsx`**
+5. stdout에 JSON 결과 출력 (CloudFront `url` 포함)
+
+**이 단계에서는 `ess/test_cases/`에 쓰지 않는다.** 사용자 확인 후 저장한다.
+
+### 4. 사용자에게 초안 보고 + 「저장」 요청
+
+- **CloudFront URL** (`url`)을 반드시 제공한다.
+- 생성된 행 수, 소스 md 경로, S3 key를 짧게 요약한다.
+- `url`이 null이면 로컬 경로와 업로드 실패 사유를 알린다.
+- **반드시** 다음을 안내한다:
+
+> 생성된 테스트케이스가 적절하면 **「저장」**이라고 입력해 주세요.  
+> 저장하면 `ess/test_cases/`에 보관되고 `test_cases_list.json`에 등록됩니다.
+
+이후 대화에서 사용자가 **「저장」**(또는 “save”, “영구 저장”)이라고 하면 **5단계**를 수행한다.  
+수정 요청이 있으면 초안 JSON/엑셀을 고친 뒤 다시 보고하고 「저장」을 재요청한다.
+
+### 5. 사용자 「저장」 확인 → `ess/test_cases/` 영구 저장
+
+사용자가 「저장」을 말하면 직전 생성 결과의 `local_path`(xlsx)와 cases JSON 경로로 저장 스크립트를 실행한다.
+
+```bash
+cd application
+python skills/testcase-generator/scripts/save_testcase.py \
+  --xlsx "{SESSION_STORAGE}/{user}/artifacts/tc/<stem>_testcase.xlsx" \
+  --cases "$ARTIFACTS_DIR/tc/<stem>_cases.json" \
+  --user "<user_id>"
+```
+
+| 인자 | 설명 |
+|------|------|
+| `--xlsx` | 초안 `.xlsx` 경로 (**필수**) |
+| `--cases` | cases JSON (있으면 `{stem}.json` 사이드카로 함께 저장) |
+| `--user` | 세션 user_id |
+| `--filename` | 선택. `ess/test_cases/`에 쓸 파일명 |
+
+저장 결과:
+
+| 경로 | 내용 |
+|------|------|
+| `{SESSION_STORAGE}/{user}/ess/test_cases/{name}.xlsx` | 테스트케이스 엑셀 |
+| `{SESSION_STORAGE}/{user}/ess/test_cases/{stem}.json` | cases JSON 사이드카 (선택) |
+| `{SESSION_STORAGE}/{user}/ess/test_cases_list.json` | 레지스트리 (`project_list.json`과 동일 구조) |
+
+`test_cases_list.json` 항목 예:
+
+```json
+{
+  "user_id": "ksdyb",
+  "updated_at": "...",
+  "documents": [
+    {
+      "filename": "NFPA855_2023_testcase.xlsx",
+      "source_path": ".../ess/test_cases/NFPA855_2023_testcase.xlsx",
+      "json_path": ".../ess/test_cases/NFPA855_2023_testcase.json",
+      "status": "saved",
+      "title": "NFPA 855 2023 Test Cases",
+      "standard": "NFPA 855 (2023)",
+      "source_md": ".../ess/regulations/NFPA855_2023.md",
+      "rows": 42,
+      "bytes": 12345,
+      "suffix": ".xlsx"
+    }
+  ]
+}
+```
+
+저장 후 사용자에게 `saved.path`와 `test_cases_list` 경로를 짧게 보고한다.
+
+## 기준 작성 가이드
+
+**기준** 열은 합격/불합격/부분합격을 판정하는 **실무 확인 체크리스트**다. 원문을 요약하지 말고, 판정자가 현장·서류에서 바로 따라 할 수 있게 작성한다.
+
+| 유형 | 기준 작성 예 (NFPA 855 4.2.1.1) |
+|------|--------------------------------|
+| **합격 판단** | ESS 설치·교체·커미셔닝·사용 관련 도면·시방서가 AHJ에 제출·승인되었고, (1)~(8) 항목이 누락 없이 포함되어 있는지 확인 |
+| **불합격 판단** | AHJ 제출·승인 서류가 없거나, (1)~(8) 중 하나라도 누락·미기재된 항목이 있는지 확인 |
+| **부분합격 판단** | AHJ 승인은 받았으나 (1)~(8) 중 일부 항목만 포함·일부 누락 여부 확인 |
+
+다른 조항도 동일 패턴을 따른다.
+
+- **제출·승인류:** `…가 AHJ/제조사/검사기관에 제출·승인(또는 등록)되었는지 확인`
+- **목록·체크리스트류:** 원문 하위 번호를 `(1)~(N)`으로 명시하고 `누락 없이 포함되어 있는지 확인`
+- **치수·간격·용량류:** 원문 수치를 그대로 넣고 `…mm 이상/이하인지 현장·도면에서 확인`
+- **시험·인증류:** `…시험 성적서·UL listing·라벨이 유효하고 해당 모델·구성과 일치하는지 확인`
+
+## 판정결과 열
+
+- Excel에서만 선택: **합격**, **불합격**, **부분합격**
+- 생성 시 값은 비운다. **자동으로 합격/불합격을 단정하지 않는다.**
+
+## 의존성
+
+`openpyxl`, `boto3` (애플리케이션 환경에 포함). 스크립트가 config.json의 `s3_bucket`, `sharing_url`, `projectName`, `region`을 읽는다. 영구 저장은 `utils.save_ess_testcase` / `ess/doc_list.TEST_CASES`를 사용한다.
+
+## 예시
+
+사용자:  
+`/…/ess/regulations/NFPA855_2023.md 경로로 테스트케이스 엑셀 만들어줘`  
+(또는 Regulations에서 **복사**한 경로를 붙여 넣음)
+
+에이전트:
+
+1. md 읽기 → cases JSON 작성 (`규격명` / `항목` 분리)  
+2. `generate_testcase_xlsx.py --cases … --user ksdyb` 실행  
+3. CloudFront URL 전달 + **「저장」** 요청  
+4. 사용자가 「저장」 → `save_testcase.py --xlsx … --cases … --user ksdyb`  
+5. `ess/test_cases/` 경로와 `test_cases_list.json` 갱신 결과 보고

@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>문서 분석 솔루션</title>
+    <meta
+      name="description"
+      content="ESS 문서를 선택하고 Harness Agent로 분석하는 문서 분석 솔루션"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Noto+Sans+KR:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="auth-gate" class="auth-gate" hidden>
+      <form class="auth-card" id="login-form">
+        <p class="auth-brand">문서 <span>분석</span> 솔루션</p>
+        <h1>로그인</h1>
+        <p class="auth-hint">ESS-work Cognito 계정으로 인증하세요.</p>
+        <p class="auth-error" id="login-error" hidden></p>
+        <label for="login-id">ID</label>
+        <input id="login-id" name="username" autocomplete="username" required />
+        <label for="login-password">Password</label>
+        <input
+          id="login-password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+        />
+        <button type="submit" id="login-btn">로그인</button>
+      </form>
+    </div>
+
+    <main class="site" id="app" hidden>
+      <header class="topbar">
+        <div>
+          <p class="brand">문서 <span>분석</span> 솔루션</p>
+          <p class="locale">Document AI · Harness Agent</p>
+        </div>
+        <div class="auth-inline">
+          <span id="user-label" class="user-label"></span>
+          <button type="button" id="logout-btn" class="ghost-btn">로그아웃</button>
+        </div>
+      </header>
+
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">문서를 고르고,<br />에이전트에게 맡기세요</h1>
+          <p>
+            Regulations · Test Cases · Projects · Drawings를 조회·선택한 뒤
+            프롬프트를 입력하면 Harness Agent가 문서를 분석합니다.
+          </p>
+        </div>
+        <div class="hero-grid" aria-hidden="true">
+          <figure class="hero-tile">
+            <img src="./images/hero-1.png" alt="" width="1024" height="1024" />
+          </figure>
+          <figure class="hero-tile">
+            <img src="./images/hero-2.png" alt="" width="1024" height="1024" />
+          </figure>
+          <figure class="hero-tile">
+            <img src="./images/hero-3.png" alt="" width="1024" height="1024" />
+          </figure>
+          <figure class="hero-tile">
+            <img src="./images/hero-5.png" alt="" width="1024" height="1024" />
+          </figure>
+        </div>
+      </section>
+
+      <section class="docs-panel" aria-labelledby="docs-label">
+        <div class="panel-head">
+          <div>
+            <div class="panel-label" id="docs-label">문서 라이브러리</div>
+            <p class="panel-sub">ess-work에서 전처리된 문서를 불러옵니다.</p>
+          </div>
+          <button type="button" id="refresh-docs" class="ghost-btn">새로고침</button>
+        </div>
+
+        <div class="tabs" role="tablist" aria-label="문서 종류">
+          <button type="button" class="tab is-active" data-kind="regulations">
+            Regulations
+          </button>
+          <button type="button" class="tab" data-kind="test_cases">Test Cases</button>
+          <button type="button" class="tab" data-kind="projects">Projects</button>
+          <button type="button" class="tab" data-kind="drawings">Drawings</button>
+        </div>
+
+        <div class="doc-list" id="doc-list" data-state="idle">
+          로그인 후 문서 목록이 표시됩니다.
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="ask-label">
+        <div class="panel-label" id="ask-label">분석 요청</div>
+
+        <div class="loaded-files" id="loaded-files" hidden>
+          <div class="loaded-label">Load files</div>
+          <div class="chips" id="selected-chips"></div>
+        </div>
+
+        <form class="ask-row" id="ask-form">
+          <textarea
+            id="prompt"
+            name="prompt"
+            rows="3"
+            placeholder="예: 선택한 규격과 프로젝트 문서를 비교하고 적합성 요약을 마크다운으로 작성해 주세요"
+            required
+          ></textarea>
+          <button type="submit" id="ask-btn">분석하기</button>
+        </form>
+
+        <div class="hints" id="hints">
+          <button
+            type="button"
+            data-prompt="선택한 문서를 요약하고 핵심 요구사항을 bullet로 정리해 주세요."
+          >
+            요약
+          </button>
+          <button
+            type="button"
+            data-prompt="선택한 규격(regulation)과 대상 문서로 regulation-evaluator 스킬을 사용해 적합성 평가를 수행하세요."
+          >
+            적합성 평가
+          </button>
+          <button
+            type="button"
+            data-prompt="선택한 규격 MD를 바탕으로 testcase-generator로 테스트케이스를 생성하세요."
+          >
+            테스트케이스
+          </button>
+        </div>
+
+        <div
+          class="result"
+          id="result"
+          data-state="idle"
+          role="status"
+          aria-live="polite"
+        >
+          문서를 선택하고 질문을 입력한 뒤 분석하기를 누르세요.
+        </div>
+
+        <div class="downloads" id="downloads" hidden>
+          <div class="loaded-label">다운로드</div>
+          <div class="chips" id="download-chips"></div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        © 문서 분석 솔루션 · Demo powered by AgentCore Harness
+      </footer>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.15/dist/amazon-cognito-identity.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
