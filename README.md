@@ -4,6 +4,9 @@
 
 ## Architecture
 
+<img width="1000" alt="image" src="https://github.com/user-attachments/assets/1859d94d-c8e0-49ea-8a90-cef03195019f" />
+
+
 ```
 Browser (CloudFront → S3 web/)
     │  Cognito JWT (ess-work)
