@@ -38,6 +38,7 @@ lambda_lmi_sg_name = "document-ai-lmi-sg"
 api_harness_name = "api-harness-document-ai"
 code_interpreter_name = "document_ai_code"
 DEFAULT_HARNESS_SKILLS = [
+    "doc-sharing",
     "regulation-evaluator",
     "testcase-generator",
     "pptx",
@@ -48,6 +49,7 @@ DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 # Async Event invoke on Lambda Managed Instances (sync API paths still ≤15m).
 LAMBDA_JOB_TIMEOUT_SECONDS = 1800
 HARNESS_TIMEOUT_SECONDS = 1800
+HARNESS_MAX_ITERATIONS = 100
 LMI_MAX_VCPU_COUNT = 30
 LMI_MIN_EXECUTION_ENVIRONMENTS = 3
 LMI_MAX_EXECUTION_ENVIRONMENTS = 6
@@ -493,18 +495,57 @@ BASE_SYSTEM_PROMPT = (
     "\n"
     "## 역할\n"
     "- 사용자가 선택한 ESS 문서를 읽고 분석·요약·규정 적합성 평가·테스트케이스 도출을 수행합니다.\n"
-    "- 분석 결과는 마크다운으로 반환하고, 생성한 산출물(pptx/docx/xlsx 등)에는 다운로드 링크를 포함하세요.\n"
+    "- 분석 결과는 마크다운으로 반환하고, 생성한 산출물(pptx/docx/xlsx 등)에는 "
+    "**doc-sharing skill이 반환한 CloudFront URL**을 포함하세요.\n"
     "\n"
     "## Skills\n"
+    "- **doc-sharing**: 산출물을 document-ai S3로 업로드하고 CloudFront 다운로드 URL 반환 "
+    "(scripts/share_artifact.py)\n"
     "- **regulation-evaluator**: 규정/컴플라이언스 평가 및 리포트 생성\n"
     "- **testcase-generator**: 요구사항·문서 기반 테스트케이스 생성\n"
     "- **pptx / docx / xlsx**: Office 문서 생성·편집 (프레젠테이션, 워드, 스프레드시트)\n"
     "- code 인터프리터에 skill 파일이 미리 마운트되지 않을 수 있습니다. 필요 시 S3에서 동기화하세요:\n"
     "  `aws s3 sync s3://{skills_bucket}/skills/<skill-name>/ /tmp/<skill-name>/`\n"
     "\n"
+    "## Runtime environment\n"
+    "- 이 환경에는 Node.js/npm이 없습니다. `node`, `npm`, `npx`를 시도하지 마세요 "
+    "(command not found / exit 127).\n"
+    "- 문서·슬라이드·스프레드시트 생성은 처음부터 Python을 사용하세요 "
+    "(예: python-docx, python-pptx, openpyxl). "
+    "docx-js / pptxgenjs 등 Node 패키지 경로는 사용하지 마세요.\n"
+    "- 필요 시 `pip3 install python-docx` / `pip3 install python-pptx` 등으로 설치한 뒤 바로 생성하세요.\n"
+    "\n"
+    "## Shell / Python packages\n"
+    "- Python 패키지 설치·실행에는 반드시 pip3를 사용하세요. pip는 이 환경에 없습니다.\n"
+    "- 예: pip3 install <package>, pip3 show <package> (pip 금지)\n"
+    "\n"
+    "## Artifact sharing (REQUIRED) — doc-sharing skill\n"
+    "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML 등 결과 파일을 생성했다면, "
+    "사용자에게 최종 답변하기 **전에** 반드시 **doc-sharing** skill의 "
+    "`share_artifact.py`를 code 인터프리터로 실행하세요.\n"
+    "- 로컬 경로(`/mnt/workspace/...`, ARTIFACTS_DIR)만 안내하는 것은 **금지**입니다. "
+    "사용자는 그 경로에 접근할 수 없습니다.\n"
+    "- 스크립트가 반환한 CloudFront URL을 최종 답변에 **반드시** 포함하세요. "
+    "URL 없이 '생성 완료'만 말하면 실패입니다.\n"
+    "- 파일이 여러 개면 파일마다 `share_artifact.py`를 각각 실행하세요.\n"
+    "- 예:\n"
+    "  `aws s3 sync s3://{skills_bucket}/skills/doc-sharing/ /tmp/doc-sharing/`\n"
+    "  `python3 /tmp/doc-sharing/scripts/share_artifact.py "
+    "--filepath \"$ARTIFACTS_DIR/파일명\" --actor-id \"<actor_id>\"`\n"
+    "- MCP `share_artifact` 도구는 이 프로젝트에 없습니다. skill로만 공유하세요.\n"
+    "- ESS CloudFront가 아니라 document-ai의 `S3_BUCKET` / `SHARING_URL`을 사용하세요.\n"
+    "\n"
+    "## Agent Workflow\n"
+    "1. 사용자 입력을 받는다\n"
+    "2. 필요 시 skill(regulation-evaluator / testcase-generator / pptx / docx / xlsx)을 "
+    "로드하고 code 인터프리터로 실행한다\n"
+    "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
+    "4. 결과 파일이 있으면 사용자 답변 전에 반드시 **doc-sharing** skill로 "
+    "CloudFront URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지)\n"
+    "5. 공유 URL을 포함한 최종 결과를 사용자에게 전달한다\n"
+    "\n"
     "## 도구\n"
     "- code 인터프리터로 skill 스크립트를 실행하세요.\n"
-    "- 필요 시 aws_knowledge로 AWS 서비스 문서를 참고하세요.\n"
     "- 결과는 근거와 함께 구조화된 마크다운으로 제시하세요.\n"
 )
 
@@ -1097,6 +1138,8 @@ def create_harness_execution_role(
             ],
             "Resource": [
                 f"arn:aws:s3:::{s3_bucket}/artifacts/*",
+                f"arn:aws:s3:::{s3_bucket}/images/*",
+                f"arn:aws:s3:::{s3_bucket}/docs/*",
                 f"arn:aws:s3:::{s3_bucket}/reports/*",
             ],
         },
@@ -1242,15 +1285,6 @@ def _default_harness_tools(code_interpreter_arn: str = "") -> List[Dict]:
         }
     return [
         {
-            "type": "remote_mcp",
-            "name": "aws_knowledge",
-            "config": {
-                "remoteMcp": {
-                    "url": "https://knowledge-mcp.global.api.aws",
-                }
-            },
-        },
-        {
             "type": "agentcore_code_interpreter",
             "name": "code",
             "config": code_config,
@@ -1389,6 +1423,54 @@ def ensure_harness_environment_public(harness_id: str) -> None:
     update_harness_safe(harness_id, environment=desired)
 
 
+def _resolve_sharing_url() -> str:
+    """document-ai CloudFront URL for artifact downloads (not ESS)."""
+    cfg = load_config_json()
+    return (
+        cfg.get("cloudfrontUrl")
+        or cfg.get("websiteUrl")
+        or ""
+    ).rstrip("/")
+
+
+def _harness_environment_variables(
+    s3_bucket: str, ess_s3_bucket: str = ""
+) -> Dict[str, str]:
+    # Do not set AWS_REGION / AWS_DEFAULT_REGION — reserved by AgentCore Harness.
+    env_vars = {
+        "LOG_LEVEL": "info",
+        "S3_BUCKET": s3_bucket,
+        "BEDROCK_REGION": region,
+    }
+    sharing_url = _resolve_sharing_url()
+    if sharing_url:
+        env_vars["SHARING_URL"] = sharing_url
+    if ess_s3_bucket:
+        env_vars["ESS_S3_BUCKET"] = ess_s3_bucket
+    return env_vars
+
+
+def ensure_harness_environment_variables(
+    harness_id: str, s3_bucket: str, ess_s3_bucket: str = ""
+) -> None:
+    desired = _harness_environment_variables(s3_bucket, ess_s3_bucket)
+    reserved = {"AWS_REGION", "AWS_DEFAULT_REGION"}
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current = h.get("environmentVariables") or {}
+    if not isinstance(current, dict):
+        current = {}
+    merged = {k: v for k, v in current.items() if k not in reserved}
+    merged.update(desired)
+    if merged == current:
+        logger.info("  Harness environmentVariables already up to date")
+        return
+    logger.info(
+        "  Updating harness environmentVariables "
+        f"(SHARING_URL={desired.get('SHARING_URL') or '(none)'})"
+    )
+    update_harness_safe(harness_id, environmentVariables=merged)
+
+
 def _system_prompt_text(s3_bucket: str) -> str:
     return BASE_SYSTEM_PROMPT.replace("{skills_bucket}", s3_bucket)
 
@@ -1437,6 +1519,17 @@ def ensure_harness_timeout(harness_id: str, timeout_seconds: int) -> None:
     update_harness_safe(harness_id, timeoutSeconds=timeout_seconds)
 
 
+def ensure_harness_max_iterations(harness_id: str, max_iterations: int) -> None:
+    """Keep agent loop budget high enough for skill + code-interpreter workflows."""
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current = h.get("maxIterations")
+    if current == max_iterations:
+        logger.info(f"  Harness maxIterations already {max_iterations}")
+        return
+    logger.info(f"  Updating harness maxIterations {current!r} -> {max_iterations}")
+    update_harness_safe(harness_id, maxIterations=max_iterations)
+
+
 def ensure_harness_tools(harness_id: str, code_interpreter_arn: str = "") -> None:
     desired = _default_harness_tools(code_interpreter_arn)
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
@@ -1444,20 +1537,19 @@ def ensure_harness_tools(harness_id: str, code_interpreter_arn: str = "") -> Non
     current_by_name = {
         t.get("name"): t for t in current if isinstance(t, dict) and t.get("name")
     }
-    needs_update = False
-    for tool in desired:
-        existing = current_by_name.get(tool["name"])
-        if existing != tool:
-            needs_update = True
-            break
-    if not needs_update and {t["name"] for t in desired}.issubset(current_by_name):
+    desired_names = [t["name"] for t in desired]
+    current_names = [t.get("name") for t in current if isinstance(t, dict)]
+    # Exact set + config match (drop removed tools such as aws_knowledge).
+    if current_names == desired_names and all(
+        current_by_name.get(t["name"]) == t for t in desired
+    ):
         logger.info("  Harness tools already up to date")
         return
-    merged = dict(current_by_name)
-    for tool in desired:
-        merged[tool["name"]] = tool
-    logger.info("  Updating harness tools (custom code interpreter)")
-    update_harness_safe(harness_id, tools=list(merged.values()))
+    logger.info(
+        "  Updating harness tools → "
+        + (", ".join(desired_names) if desired_names else "(none)")
+    )
+    update_harness_safe(harness_id, tools=desired)
 
 
 def ensure_harness_skills(harness_id: str, s3_bucket: str) -> None:
@@ -1504,15 +1596,7 @@ def create_or_get_harness(
     tools = _default_harness_tools(code_interpreter_arn)
     skills = build_default_harness_skills(s3_bucket)
 
-    env_vars = {
-        "LOG_LEVEL": "info",
-        "S3_BUCKET": s3_bucket,
-        "AWS_REGION": region,
-        "AWS_DEFAULT_REGION": region,
-        "BEDROCK_REGION": region,
-    }
-    if ess_s3_bucket:
-        env_vars["ESS_S3_BUCKET"] = ess_s3_bucket
+    env_vars = _harness_environment_variables(s3_bucket, ess_s3_bucket)
 
     existing = find_harness_by_api_name(harness_api_name)
     if existing:
@@ -1587,7 +1671,7 @@ def create_or_get_harness(
                     "strategy": "sliding_window",
                     "config": {"slidingWindow": {"messagesCount": 50}},
                 },
-                maxIterations=20,
+                maxIterations=HARNESS_MAX_ITERATIONS,
                 maxTokens=50000,
                 timeoutSeconds=HARNESS_TIMEOUT_SECONDS,
                 environment=environment,
@@ -1609,11 +1693,13 @@ def create_or_get_harness(
 
     ensure_harness_memory_disabled(harness_id)
     ensure_harness_environment_public(harness_id)
+    ensure_harness_environment_variables(harness_id, s3_bucket, ess_s3_bucket)
     ensure_harness_model(harness_id, DEFAULT_MODEL_ID)
     ensure_harness_system_prompt(harness_id, s3_bucket)
     ensure_harness_tools(harness_id, code_interpreter_arn)
     ensure_harness_skills(harness_id, s3_bucket)
     ensure_harness_timeout(harness_id, HARNESS_TIMEOUT_SECONDS)
+    ensure_harness_max_iterations(harness_id, HARNESS_MAX_ITERATIONS)
     harness_arn = wait_for_harness_ready(harness_id)
     return {
         "harness_id": harness_id,
@@ -1689,12 +1775,36 @@ def _prune_removed_skills_from_s3(s3_bucket_name: str) -> int:
     return removed
 
 
+def prepare_doc_sharing_skill_config(s3_bucket_name: str) -> None:
+    """Write skills/doc-sharing/config.json for Code Interpreter fallback."""
+    skill_dir = os.path.join(SKILLS_DIR, "doc-sharing")
+    if not os.path.isdir(skill_dir):
+        logger.warning(f"doc-sharing skill dir missing: {skill_dir}")
+        return
+    sharing_url = _resolve_sharing_url()
+    payload = {
+        "s3_bucket": s3_bucket_name,
+        "sharing_url": sharing_url,
+        "region": region,
+    }
+    dest = os.path.join(skill_dir, "config.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.info(
+        f"  doc-sharing config.json ready "
+        f"(bucket={s3_bucket_name}, sharing_url={sharing_url or '(none)'})"
+    )
+
+
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
     """Upload skills/ to s3://{bucket}/skills/ for InvokeHarness S3 skill attach."""
     logger.info(f"Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
     if not os.path.isdir(SKILLS_DIR):
         logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping upload")
         return 0
+
+    prepare_doc_sharing_skill_config(s3_bucket_name)
 
     uploaded = 0
     failed = 0
@@ -1920,11 +2030,15 @@ def create_lambda_harness(
         "JOB_TTL_SECONDS": str(24 * 3600),
         "ESS_S3_BUCKET": ess_s3,
         "ESS_SHARING_URL": ess_config.get("sharing_url") or "",
+        "SHARING_URL": _resolve_sharing_url(),
         "COGNITO_USER_POOL_ID": ess_config.get("cognito_user_pool_id") or "",
         "COGNITO_CLIENT_ID": ess_config.get("cognito_client_id") or "",
         "COGNITO_REGION": ess_config.get("cognito_region") or region,
         "LAMBDA_COMPUTE": "managed-instances",
         "LAMBDA_JOB_TIMEOUT_SECONDS": str(LAMBDA_JOB_TIMEOUT_SECONDS),
+        # Idle HTTP read timeout for InvokeHarness stream (must cover long tool gaps).
+        "HARNESS_INVOKE_READ_TIMEOUT": str(LAMBDA_JOB_TIMEOUT_SECONDS),
+        "MIN_RESULT_CHARS": "400",
     }
 
     return deploy_lambda_function(
@@ -2193,6 +2307,7 @@ def deploy_harness_stack(
         "lambdaCompute": "managed-instances",
         "lambdaJobTimeoutSeconds": LAMBDA_JOB_TIMEOUT_SECONDS,
         "harnessTimeoutSeconds": HARNESS_TIMEOUT_SECONDS,
+        "harnessMaxIterations": HARNESS_MAX_ITERATIONS,
         "jobsTableName": jobs_info["jobsTableName"],
         "jobsTableArn": jobs_info["jobsTableArn"],
         "apiGatewayId": api_info["api_id"],

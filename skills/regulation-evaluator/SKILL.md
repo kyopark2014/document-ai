@@ -44,7 +44,7 @@ description: >
 - [ ] 4. 조항별 평가 (필요 시 retrieve)
 - [ ] 5. 평가 JSON 저장 (필수 키·별칭 준수)
 - [ ] 6. generate_compliance_report.py 실행
-- [ ] 7. upload_file_to_s3 + 요약
+- [ ] 7. doc-sharing (share_artifact.py) + 요약
 ```
 
 ### 1–2. 입력 · 대상 문서 먼저 읽기
@@ -166,9 +166,16 @@ python skills/regulation-evaluator/scripts/generate_compliance_report.py \
 
 ### 7. 업로드 · 보고
 
-1. **`upload_file_to_s3`에는 6단계 stdout의 `path`만** 넘긴다  
+1. **doc-sharing** skill의 `share_artifact.py`에 6단계 stdout의 `path`만 넘긴다  
    (`--output-name` 원본 이름을 하드코딩하면 예전 파일을 올릴 수 있음)
 2. 반환된 CloudFront URL과 함께 집계·강점·우선 보완 요약
+
+```bash
+aws s3 sync s3://$S3_BUCKET/skills/doc-sharing/ /tmp/doc-sharing/
+python3 /tmp/doc-sharing/scripts/share_artifact.py \
+  --filepath "<6단계 stdout path>" \
+  --actor-id "<actor_id>"
+```
 
 ## 조치 우선순위
 

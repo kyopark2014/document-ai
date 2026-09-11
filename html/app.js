@@ -17,8 +17,10 @@
   const AUTH_KEY = "documentAiAuth";
   const SESSION_KEY = "documentAiSessionId";
   const LAST_RESULT_KEY = "documentAiLastResult";
+  const ACTIVE_JOB_KEY = "documentAiActiveJob";
   const POLL_INTERVAL_MS = 2500;
-  const POLL_MAX_MS = 15 * 60 * 1000;
+  // Match Lambda/Harness job budget (30 min).
+  const POLL_MAX_MS = 30 * 60 * 1000;
 
   const authGate = document.getElementById("auth-gate");
   const app = document.getElementById("app");
@@ -170,6 +172,69 @@
     return true;
   }
 
+  function saveActiveJob(payload) {
+    try {
+      localStorage.setItem(
+        ACTIVE_JOB_KEY,
+        JSON.stringify({
+          username: (auth && auth.username) || "",
+          jobId: String((payload && payload.jobId) || ""),
+          prompt: String((payload && payload.prompt) || ""),
+          sessionId: String((payload && payload.sessionId) || ""),
+          startedAt: Date.now(),
+        })
+      );
+    } catch (_) {}
+  }
+
+  function clearActiveJob() {
+    try {
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+    } catch (_) {}
+  }
+
+  function loadActiveJob() {
+    try {
+      var raw = localStorage.getItem(ACTIVE_JOB_KEY);
+      if (!raw) return null;
+      var data = JSON.parse(raw);
+      if (!data || !data.jobId) return null;
+      if (
+        auth &&
+        data.username &&
+        auth.username &&
+        data.username !== auth.username
+      ) {
+        return null;
+      }
+      // Drop stale jobs older than poll budget + buffer.
+      if (data.startedAt && Date.now() - data.startedAt > POLL_MAX_MS + 5 * 60 * 1000) {
+        clearActiveJob();
+        return null;
+      }
+      return data;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function applySucceededJob(job, prompt) {
+    if (job && job.sessionId) {
+      try {
+        sessionStorage.setItem(SESSION_KEY, job.sessionId);
+      } catch (_) {}
+    }
+    var resultText = (job && job.result) || "(응답이 비어 있습니다)";
+    setResult("idle", resultText, { markdown: true });
+    setDownloads((job && job.downloadLinks) || []);
+    saveLastResult({
+      prompt: prompt || "",
+      resultText: resultText,
+      downloadLinks: (job && job.downloadLinks) || [],
+    });
+    clearActiveJob();
+  }
+
   function rewriteDownloadUrl(url, s3Key) {
     var key = s3Key || extractS3Key(url);
     if (key && documentsUrl) {
@@ -275,7 +340,8 @@
     authGate.hidden = true;
     app.hidden = false;
     userLabel.textContent = auth ? auth.username : "";
-    restoreLastResult();
+    // Prefer resuming an in-flight job over restoring a previous result.
+    if (!loadActiveJob()) restoreLastResult();
   }
 
   function cognitoAvailable() {
@@ -768,7 +834,7 @@
       await sleep(POLL_INTERVAL_MS);
     }
     throw new Error(
-      "분석이 예상보다 오래 걸립니다. 잠시 후 다시 시도하거나 질문을 짧게 줄여 주세요."
+      "분석이 30분 안에 끝나지 않았습니다. 잠시 후 페이지를 새로고침하면 진행 중인 작업을 이어서 확인합니다."
     );
   }
 
@@ -826,22 +892,44 @@
           sessionStorage.setItem(SESSION_KEY, created.sessionId);
         } catch (_) {}
       }
+      saveActiveJob({
+        jobId: created.jobId,
+        prompt: q,
+        sessionId: created.sessionId || sessionId,
+      });
       setResult("loading", "에이전트가 문서를 분석하는 중입니다…");
       var job = await pollJob(created.jobId);
-      if (job.sessionId) {
-        try {
-          sessionStorage.setItem(SESSION_KEY, job.sessionId);
-        } catch (_) {}
-      }
-      setResult("idle", job.result || "(응답이 비어 있습니다)", { markdown: true });
-      setDownloads(job.downloadLinks || []);
-      saveLastResult({
-        prompt: q,
-        resultText: job.result || "(응답이 비어 있습니다)",
-        downloadLinks: job.downloadLinks || [],
-      });
+      applySucceededJob(job, q);
     } catch (err) {
-      setResult("error", (err && err.message) || String(err));
+      // Keep active job on timeout so refresh can resume; clear on hard failures.
+      var msg = (err && err.message) || String(err);
+      if (msg.indexOf("30분") === -1) {
+        clearActiveJob();
+      }
+      setResult("error", msg);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function resumeActiveJobIfAny() {
+    var active = loadActiveJob();
+    if (!active || !active.jobId || !jobsUrl || !auth) return false;
+    if (active.prompt) input.value = active.prompt;
+    button.disabled = true;
+    setResult("loading", "이전 분석 작업을 이어서 확인하는 중…");
+    try {
+      var job = await pollJob(active.jobId);
+      applySucceededJob(job, active.prompt || "");
+      return true;
+    } catch (err) {
+      var msg = (err && err.message) || String(err);
+      if (msg.indexOf("30분") === -1 && msg.indexOf("찾을 수 없") === -1) {
+        // Job finished as FAILED or gone — stop auto-resume.
+        clearActiveJob();
+      }
+      setResult("error", msg);
+      return false;
     } finally {
       button.disabled = false;
     }
@@ -859,6 +947,7 @@
       saveAuth(session);
       showApp();
       await fetchDocuments();
+      await resumeActiveJobIfAny();
     } catch (err) {
       var message =
         (err && (err.message || err.code)) || String(err) || "로그인 실패";
@@ -906,7 +995,9 @@
   auth = loadAuth();
   if (auth) {
     showApp();
-    fetchDocuments();
+    fetchDocuments().then(function () {
+      return resumeActiveJobIfAny();
+    });
   } else {
     showLogin();
   }

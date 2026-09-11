@@ -23,7 +23,7 @@ Lambda Managed Instances  (lambda-harness-document-ai)
 AgentCore Harness (document_ai, PUBLIC, memory off)
   timeoutSeconds=1800
   + Code Interpreter (document_ai_code)
-  + Skills: regulation-evaluator, testcase-generator, pptx, docx, xlsx
+  + Skills: doc-sharing, regulation-evaluator, testcase-generator, pptx, docx, xlsx
 ```
 
 **ESS-work 연동:** 형제 경로 `../ess-work/application/config.json`에서 Cognito·S3·sharing URL을 읽어 Lambda 환경 변수와 `html/config.js`에 주입합니다.
@@ -40,6 +40,40 @@ AgentCore Harness (document_ai, PUBLIC, memory off)
 | Harness API name | `document_ai` |
 | Code interpreter | `document_ai_code` |
 | Region | `us-west-2` |
+
+## Skills
+
+기본으로 Harness에 붙는 S3 skill은 `skills/` 아래를 `s3://{bucket}/skills/`에 올린 뒤 InvokeHarness `skills.s3`로 연결합니다.
+
+| Skill | 역할 |
+|---|---|
+| **doc-sharing** | 산출물을 document-ai S3로 올리고 CloudFront 다운로드 URL 반환 |
+| regulation-evaluator | 규격 TC + 대상 md 적합성 평가 → Excel 리포트 |
+| testcase-generator | 문서 기반 테스트케이스 생성 |
+| pptx / docx / xlsx | Office 문서 생성·편집 |
+
+### doc-sharing
+
+산출물(xlsx/pptx/docx/pdf 등)은 Code Interpreter의 로컬 경로(`/mnt/workspace/{actor_id}/artifacts/…`)에만 존재하므로, 사용자가 받을 수 있는 **CloudFront URL**이 필요합니다. MCP로 파일을 한 번 더 넘기지 않고, **같은 code 인터프리터에서 로컬 파일을 S3에 PutObject** 합니다.
+
+```
+ARTIFACTS_DIR 로컬 파일
+    → s3://{S3_BUCKET}/artifacts/{actor_id}/…
+    → {SHARING_URL}/artifacts/{actor_id}/…
+```
+
+- **버킷 / CDN:** document-ai 전용 S3·CloudFront (`config.json`의 `bucketName`, `cloudfrontUrl`). ESS sharing URL을 쓰지 않습니다.
+- **환경 변수:** Harness에 `S3_BUCKET`, `SHARING_URL`을 주입합니다. skill `config.json`(배포 시 생성)은 fallback입니다.
+- **스크립트:** `skills/doc-sharing/scripts/share_artifact.py`
+
+```bash
+aws s3 sync s3://$S3_BUCKET/skills/doc-sharing/ /tmp/doc-sharing/
+python3 /tmp/doc-sharing/scripts/share_artifact.py \
+  --filepath "$ARTIFACTS_DIR/reports/report.xlsx" \
+  --actor-id "<actor_id>"
+```
+
+성공 시 stdout JSON의 `url`을 최종 답변에 넣습니다. system prompt는 산출물이 있으면 **반드시 doc-sharing으로 URL을 만든 뒤** 응답하도록 강제합니다 (로컬 경로만 안내 금지).
 
 ## 비동기 처리
 
@@ -164,6 +198,7 @@ python3 uninstaller.py --region us-west-2 --debug
 - Cognito User Pool은 ess-work가 소유합니다. document-ai uninstaller는 Cognito를 삭제하지 않습니다.
 - Lambda는 Cognito Access Token을 `GetUser`로 검증합니다 (PyJWT/cryptography 미사용).
 - Lambda에 `boto3>=1.40.0`을 manylinux 휠로 번들합니다 (InvokeHarness skills.s3). Runtime은 LMI 지원을 위해 **python3.13** 입니다.
+- 산출물 공유는 **doc-sharing** skill이 document-ai S3·CloudFront URL을 반환합니다. MCP artifact-share는 사용하지 않습니다. 자세한 내용은 [doc-sharing](#doc-sharing)을 보세요.
 - 긴 분석은 `POST /jobs` + Event worker(LMI, 최대 30분) + `GET /jobs/{jobId}` 폴링입니다. 자세한 내용은 [비동기 처리](#비동기-처리)를 보세요.
 - HTTP API CORS가 OPTIONS preflight를 처리합니다 (Lambda OPTIONS 라우트 없음).
 - LMI capacity provider는 EC2 인스턴스를 띄우므로, 사용 후 `uninstaller.py`로 정리하는 것을 권장합니다.

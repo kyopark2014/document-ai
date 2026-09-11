@@ -27,7 +27,7 @@ from urllib.parse import quote, unquote
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EventStreamError, ReadTimeoutError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -41,6 +41,26 @@ SKILLS_S3_PREFIX = (os.environ.get("SKILLS_S3_PREFIX") or "skills").strip().stri
 JOBS_TABLE = (os.environ.get("JOBS_TABLE") or "").strip()
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS") or str(24 * 3600))
 MAX_RESULT_CHARS = int(os.environ.get("MAX_RESULT_CHARS") or "350000")
+# Align InvokeHarness HTTP read idle timeout with Lambda/Harness job budget (was 300s —
+# long code-interpreter gaps produced a truncated stream that we wrongly marked SUCCEEDED).
+LAMBDA_JOB_TIMEOUT_SECONDS = int(
+    os.environ.get("LAMBDA_JOB_TIMEOUT_SECONDS") or "1800"
+)
+HARNESS_INVOKE_READ_TIMEOUT = int(
+    os.environ.get("HARNESS_INVOKE_READ_TIMEOUT")
+    or str(LAMBDA_JOB_TIMEOUT_SECONDS)
+)
+MIN_RESULT_CHARS = int(os.environ.get("MIN_RESULT_CHARS") or "400")
+_INCOMPLETE_TAIL_MARKERS = (
+    "진행하겠습니다",
+    "시작하겠습니다",
+    "확인하겠습니다",
+    "분석하겠습니다",
+    "평가를 진행",
+    "선별하고 평가",
+    "내려받겠습니다",
+    "로드하겠습니다",
+)
 DEFAULT_SKILLS = [
     name.strip()
     for name in (
@@ -123,10 +143,14 @@ def _client():
             "bedrock-agentcore",
             region_name=BEDROCK_REGION,
             config=Config(
-                read_timeout=300,
+                read_timeout=HARNESS_INVOKE_READ_TIMEOUT,
                 connect_timeout=60,
                 retries={"max_attempts": 0},
             ),
+        )
+        logger.info(
+            "bedrock-agentcore client read_timeout=%ss",
+            HARNESS_INVOKE_READ_TIMEOUT,
         )
     return _runtime_client
 
@@ -387,6 +411,33 @@ def build_harness_skills(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
+def _incomplete_result_reason(
+    text: str, last_stop_reason: Optional[str]
+) -> Optional[str]:
+    """Return an error message when the stream ended without a usable report."""
+    body = (text or "").strip()
+    if last_stop_reason in ("tool_use", "toolUse", "tool_use_forced"):
+        return (
+            f"Harness ended while tools were still in progress "
+            f"(stopReason={last_stop_reason}, chars={len(body)})"
+        )
+    if not body:
+        return "Harness returned an empty result"
+    tail = body[-160:]
+    for marker in _INCOMPLETE_TAIL_MARKERS:
+        if marker in tail:
+            return (
+                "Harness stopped before producing the final report "
+                f"(incomplete narration, chars={len(body)})"
+            )
+    if len(body) < MIN_RESULT_CHARS:
+        return (
+            "Harness result is too short to be a completed analysis "
+            f"(chars={len(body)}, min={MIN_RESULT_CHARS})"
+        )
+    return None
+
+
 def _collect_harness_text(
     harness_arn: str,
     prompt: str,
@@ -415,16 +466,54 @@ def _collect_harness_text(
         raise RuntimeError(f"Empty Harness response: {response}")
 
     chunks: list[str] = []
-    for event in stream:
-        if "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"].get("delta") or {}
-            text = delta.get("text")
-            if text:
-                chunks.append(text)
-        elif "runtimeClientError" in event:
-            msg = (event["runtimeClientError"] or {}).get("message") or "unknown error"
-            raise RuntimeError(f"Harness runtime error: {msg}")
-    return "".join(chunks)
+    event_count = 0
+    text_events = 0
+    last_stop_reason: Optional[str] = None
+    try:
+        for event in stream:
+            event_count += 1
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"].get("delta") or {}
+                text = delta.get("text")
+                if text:
+                    chunks.append(text)
+                    text_events += 1
+            elif "messageStop" in event:
+                last_stop_reason = (event.get("messageStop") or {}).get("stopReason")
+            elif "runtimeClientError" in event:
+                msg = (event["runtimeClientError"] or {}).get("message") or "unknown error"
+                raise RuntimeError(f"Harness runtime error: {msg}")
+            elif "internalServerException" in event:
+                msg = (event.get("internalServerException") or {}).get("message") or str(
+                    event["internalServerException"]
+                )
+                raise RuntimeError(f"Harness internal error: {msg}")
+            elif "validationException" in event:
+                msg = (event.get("validationException") or {}).get("message") or str(
+                    event["validationException"]
+                )
+                raise RuntimeError(f"Harness validation error: {msg}")
+    except (ReadTimeoutError, EventStreamError) as e:
+        partial = "".join(chunks)
+        raise RuntimeError(
+            "Harness stream interrupted "
+            f"(events={event_count}, text_events={text_events}, "
+            f"partial_chars={len(partial)}, stopReason={last_stop_reason}, "
+            f"read_timeout={HARNESS_INVOKE_READ_TIMEOUT}s): {e}"
+        ) from e
+
+    text = "".join(chunks)
+    logger.info(
+        "harness stream done events=%s text_events=%s chars=%s stopReason=%s",
+        event_count,
+        text_events,
+        len(text),
+        last_stop_reason,
+    )
+    incomplete = _incomplete_result_reason(text, last_stop_reason)
+    if incomplete:
+        raise RuntimeError(incomplete)
+    return text
 
 
 def _truncate_result(text: str) -> Tuple[str, bool]:
@@ -1068,9 +1157,13 @@ def _build_analysis_prompt(
     documents: List[Dict[str, Any]],
     user: str,
 ) -> str:
+    actor = (user or "user").strip() or "user"
+    artifacts_dir = f"/mnt/workspace/{actor}/artifacts"
     lines = [
         "다음 ESS 문서를 분석하세요.",
         f"사용자: {user}",
+        f"actor_id: {actor}",
+        f"ARTIFACTS_DIR: {artifacts_dir}",
         "",
         "## 사용자 요청",
         user_prompt.strip() or "(요청 없음 — 선택된 문서를 요약·분석하세요)",
@@ -1123,8 +1216,13 @@ def _build_analysis_prompt(
         [
             "## 지침",
             "- 필요 시 regulation-evaluator / testcase-generator / pptx / docx / xlsx 스킬을 사용하세요.",
+            f"- 모든 산출물은 반드시 ARTIFACTS_DIR ({artifacts_dir}) 아래에 저장하세요.",
+            "- 산출물(xlsx/pptx/docx/pdf 등)을 생성했다면 최종 답변 전에 **반드시 doc-sharing** "
+            "skill(`share_artifact.py`)로 CloudFront URL을 만든 뒤 그 URL만 사용자에게 전달하세요.",
+            "- 로컬 경로(`/mnt/workspace/...`)만 안내하는 것은 금지입니다.",
+            f"- 예: `python3 /tmp/doc-sharing/scripts/share_artifact.py "
+            f"--filepath \"{artifacts_dir}/파일\" --actor-id \"{actor}\"`",
             "- 결과는 마크다운으로 작성하세요.",
-            "- 생성한 산출물이 있으면 다운로드 가능한 URL 또는 경로를 명시하세요.",
             "- 문서 내용이 URL로만 주어지면 code 인터프리터로 내려받아 분석하세요.",
         ]
     )
