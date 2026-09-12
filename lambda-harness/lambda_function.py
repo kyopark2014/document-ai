@@ -423,24 +423,42 @@ def _incomplete_result_reason(
 ) -> Optional[str]:
     """Return an error message when the stream ended without a usable report."""
     body = (text or "").strip()
-    if last_stop_reason in ("tool_use", "toolUse", "tool_use_forced"):
+    stop = (last_stop_reason or "").strip()
+    stop_l = stop.lower()
+
+    # Prefer explicit model/harness stop reasons over heuristic narration checks.
+    if stop_l in (
+        "max_output_tokens_exceeded",
+        "max_tokens",
+        "maxtokens",
+        "length",
+    ):
+        return (
+            "Harness hit the output token limit before finishing the report "
+            f"(stopReason={stop or last_stop_reason}, chars={len(body)}). "
+            "Try a narrower prompt, fewer documents, or raise harness maxTokens."
+        )
+    if stop_l in ("tool_use", "tooluse", "tool_use_forced"):
         return (
             f"Harness ended while tools were still in progress "
-            f"(stopReason={last_stop_reason}, chars={len(body)})"
+            f"(stopReason={stop or last_stop_reason}, chars={len(body)})"
         )
     if not body:
-        return "Harness returned an empty result"
+        reason = f" (stopReason={stop})" if stop else ""
+        return f"Harness returned an empty result{reason}"
     tail = body[-160:]
     for marker in _INCOMPLETE_TAIL_MARKERS:
         if marker in tail:
+            extra = f", stopReason={stop}" if stop else ""
             return (
                 "Harness stopped before producing the final report "
-                f"(incomplete narration, chars={len(body)})"
+                f"(incomplete narration, chars={len(body)}{extra})"
             )
     if len(body) < MIN_RESULT_CHARS:
+        extra = f", stopReason={stop}" if stop else ""
         return (
             "Harness result is too short to be a completed analysis "
-            f"(chars={len(body)}, min={MIN_RESULT_CHARS})"
+            f"(chars={len(body)}, min={MIN_RESULT_CHARS}{extra})"
         )
     return None
 
@@ -1745,20 +1763,95 @@ def _resign_download_url(url: str) -> Optional[str]:
     )
 
 
-def _rewrite_result_download_urls(text: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Replace broken agent S3 URLs with Lambda-presigned us-west-2 URLs."""
+def _parse_api_artifact_viewer_url(url: str) -> Optional[str]:
+    """If url is API /artifacts/view|download/{rest}, return rest; else None."""
+    from urllib.parse import urlparse, unquote as _unquote
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    path = _unquote((parsed.path or "").lstrip("/"))
+    for prefix in ("artifacts/view/", "artifacts/download/"):
+        if path.lower().startswith(prefix):
+            rest = path[len(prefix) :]
+            return rest or None
+    return None
+
+
+def _sharing_url_object_key(url: str) -> Optional[str]:
+    """Extract object key from document-ai CloudFront / sharing URL."""
+    from urllib.parse import urlparse, unquote as _unquote
+
+    base = (SHARING_URL or "").rstrip("/")
+    if not base or not url:
+        return None
+    try:
+        if not url.startswith(base + "/") and url.rstrip("/") != base:
+            return None
+        parsed = urlparse(url)
+        path = _unquote((parsed.path or "").lstrip("/"))
+    except Exception:
+        return None
+    if path.startswith(("artifacts/", "images/", "docs/")):
+        return path
+    return None
+
+
+def _rewrite_result_download_urls(
+    text: str, user_id: str = ""
+) -> Tuple[str, List[Dict[str, str]]]:
+    """Replace broken agent S3 URLs; keep viewer URLs; attach real s3_key."""
     links = _extract_download_links_from_result(text)
     rewritten: List[Dict[str, str]] = []
     body = text or ""
+    segment = _sanitize_user_segment(user_id) if user_id else ""
+
     for item in links:
         original = item["url"]
+        label = item.get("label") or original.rsplit("/", 1)[-1]
+
+        viewer_rest = _parse_api_artifact_viewer_url(original)
+        if viewer_rest is not None:
+            rest = (
+                _collapse_duplicate_user_prefix(viewer_rest, segment)
+                if segment
+                else viewer_rest
+            )
+            s3_key = f"artifacts/{segment}/{rest}" if segment and rest else ""
+            rewritten.append(
+                {"label": label, "url": original, "s3_key": s3_key}
+            )
+            continue
+
+        sharing_key = _sharing_url_object_key(original)
+        if sharing_key:
+            rewritten.append(
+                {"label": label, "url": original, "s3_key": sharing_key}
+            )
+            continue
+
         fresh = _resign_download_url(original)
         if not fresh:
-            rewritten.append(item)
+            parsed = _parse_s3_http_url(original)
+            rewritten.append(
+                {
+                    "label": label,
+                    "url": original,
+                    "s3_key": (parsed[1] if parsed else ""),
+                }
+            )
             continue
         if original in body:
             body = body.replace(original, fresh)
-        rewritten.append({"label": item["label"], "url": fresh, "s3_key": (_parse_s3_http_url(original) or ("", ""))[1]})
+        parsed = _parse_s3_http_url(original)
+        rewritten.append(
+            {
+                "label": label,
+                "url": fresh,
+                "s3_key": (parsed[1] if parsed else ""),
+            }
+        )
     # de-dupe by url
     seen = set()
     out: List[Dict[str, str]] = []
@@ -1777,6 +1870,14 @@ def _sanitize_user_segment(user_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._\-]", "_", (user_id or "").strip()) or "user"
 
 
+def _collapse_duplicate_user_prefix(rest: str, segment: str) -> str:
+    """artifacts/{user}/{user}/file → file (under that user prefix)."""
+    parts = [p for p in (rest or "").replace("\\", "/").split("/") if p]
+    while len(parts) >= 2 and parts[0] == segment:
+        parts = parts[1:]
+    return "/".join(parts) if parts else (rest or "")
+
+
 def _normalize_artifact_rest(file_path: str, user_id: str) -> str:
     raw = (file_path or "").strip().lstrip("/")
     parts = [p for p in raw.replace("\\", "/").split("/") if p]
@@ -1789,13 +1890,13 @@ def _normalize_artifact_rest(file_path: str, user_id: str) -> str:
         rest = "/".join(parts[2:])
         if not rest:
             raise ValueError("File path is required")
-        return rest
+        return _collapse_duplicate_user_prefix(rest, segment)
     if parts[0] == segment:
         rest = "/".join(parts[1:])
         if not rest:
             raise ValueError("File path is required")
-        return rest
-    return "/".join(parts)
+        return _collapse_duplicate_user_prefix(rest, segment)
+    return _collapse_duplicate_user_prefix("/".join(parts), segment)
 
 
 def _artifact_s3_key(user_id: str, file_path: str) -> Tuple[str, str]:
@@ -1803,6 +1904,28 @@ def _artifact_s3_key(user_id: str, file_path: str) -> Tuple[str, str]:
     segment = _sanitize_user_segment(user_id)
     key = f"artifacts/{segment}/{rest}"
     return key, rest.rsplit("/", 1)[-1]
+
+
+def _resolve_artifact_s3_key(
+    bucket: str, user_id: str, file_path: str
+) -> Tuple[str, str]:
+    """Return (s3_key, file_name), including legacy double-actor keys."""
+    rest = _normalize_artifact_rest(file_path, user_id)
+    segment = _sanitize_user_segment(user_id)
+    file_name = rest.rsplit("/", 1)[-1]
+    candidates = [
+        f"artifacts/{segment}/{rest}",
+        # Legacy: share_artifact once nested actor under ARTIFACTS_DIR again
+        f"artifacts/{segment}/{segment}/{rest}",
+    ]
+    seen = set()
+    for key in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        if _object_exists(bucket, key):
+            return key, file_name
+    return candidates[0], file_name
 
 
 def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]:
@@ -1822,7 +1945,19 @@ def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]
         return _response(401, {"error": str(e)})
 
     try:
-        s3_key, file_name = _artifact_s3_key(user, file_path)
+        # Validate path / ownership first (raises PermissionError / ValueError)
+        _artifact_s3_key(user, file_path)
+    except PermissionError as e:
+        return _response(403, {"error": str(e)})
+    except ValueError as e:
+        return _response(400, {"error": str(e)})
+
+    bucket = (S3_BUCKET or "").strip()
+    if not bucket:
+        return _response(500, {"error": "S3_BUCKET is not configured"})
+
+    try:
+        s3_key, file_name = _resolve_artifact_s3_key(bucket, user, file_path)
     except PermissionError as e:
         return _response(403, {"error": str(e)})
     except ValueError as e:
@@ -1834,9 +1969,6 @@ def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]
             400, {"error": "Viewer supports .md / .markdown / .json / .csv only"}
         )
 
-    bucket = (S3_BUCKET or "").strip()
-    if not bucket:
-        return _response(500, {"error": "S3_BUCKET is not configured"})
     if not _object_exists(bucket, s3_key):
         return _response(404, {"error": f"Artifact not found: {s3_key}"})
 
@@ -1886,7 +2018,7 @@ def _handle_artifacts(event: Dict[str, Any], parts: List[str]) -> Dict[str, Any]
 def _handle_download(event: Dict[str, Any]) -> Dict[str, Any]:
     """GET /download?key=artifacts/... → 302 to region-correct presigned URL."""
     try:
-        _require_user(event)
+        user = _require_user(event)
     except PermissionError as e:
         return _response(401, {"error": str(e)})
 
@@ -1897,6 +2029,15 @@ def _handle_download(event: Dict[str, Any]) -> Dict[str, Any]:
     bucket = (params.get("bucket") or S3_BUCKET or "").strip()
     if not bucket:
         return _response(500, {"error": "S3_BUCKET is not configured"})
+
+    # Frontend once mis-parsed /artifacts/view/{file} as an S3 key.
+    view_m = re.match(r"^artifacts/(?:view|download)/(.+)$", key, flags=re.IGNORECASE)
+    if view_m:
+        try:
+            key, _ = _resolve_artifact_s3_key(bucket, user, view_m.group(1))
+        except (PermissionError, ValueError) as e:
+            return _response(400, {"error": str(e)})
+
     if not _object_exists(bucket, key):
         # fall back to ESS bucket for source docs
         if ESS_S3_BUCKET and bucket != ESS_S3_BUCKET and _object_exists(ESS_S3_BUCKET, key):
@@ -2060,7 +2201,9 @@ def _run_job_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             skills=skills,
         )
         result, truncated = _truncate_result(result)
-        result, links = _rewrite_result_download_urls(result)
+        result, links = _rewrite_result_download_urls(
+            result, user_id=str(actor_id or "")
+        )
         attrs: Dict[str, Any] = {
             "status": "SUCCEEDED",
             "result": result,
@@ -2115,7 +2258,9 @@ def _handle_sync_invoke(payload: Dict[str, Any], user: str = "") -> Dict[str, An
         logger.exception("InvokeHarness failed")
         return _response(502, {"error": str(e), "sessionId": session_id})
 
-    result, links = _rewrite_result_download_urls(result)
+    result, links = _rewrite_result_download_urls(
+        result, user_id=str(actor_id or user or "")
+    )
     return _response(
         200,
         {

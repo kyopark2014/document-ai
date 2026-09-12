@@ -56,6 +56,20 @@ def _basename(filepath: str) -> str:
     return re.sub(r"[^A-Za-z0-9._\-]", "_", name.replace("..", "_")) or "upload.bin"
 
 
+def _strip_leading_actor(rest: str, actor: str) -> str:
+    """Remove duplicated actor segments from rest under artifacts/{actor}/.
+
+    Agents sometimes save under ``$ARTIFACTS_DIR/{actor}/file`` even though
+    ``ARTIFACTS_DIR`` is already ``/mnt/workspace/{actor}/artifacts``, which
+    would otherwise upload to ``artifacts/{actor}/{actor}/file``.
+    """
+    actor = _sanitize_actor(actor)
+    parts = [p for p in (rest or "").replace("\\", "/").split("/") if p]
+    while len(parts) >= 2 and _sanitize_actor(parts[0]) == actor:
+        parts = parts[1:]
+    return "/".join(parts) if parts else (rest or "")
+
+
 def _infer_actor_and_rest(filepath: str, actor_id: Optional[str]) -> Tuple[str, str, str]:
     """Return (actor, dest_prefix, rest_under_prefix)."""
     path = os.path.abspath(os.path.expanduser(filepath)).replace("\\", "/")
@@ -78,17 +92,23 @@ def _infer_actor_and_rest(filepath: str, actor_id: Optional[str]) -> Tuple[str, 
     if len(parts) >= 2 and parts[1] in _ALLOWED_PREFIXES:
         inferred_user = _sanitize_actor(parts[0])
         prefix = parts[1]
+        actor = user or inferred_user
         rest = "/".join(parts[2:]) or _basename(path)
-        return user or inferred_user, prefix, rest
+        rest = _strip_leading_actor(rest, actor) or _basename(path)
+        return actor, prefix, rest
 
     # artifacts|images|docs/... (relative to cwd or already stripped)
     for prefix in _ALLOWED_PREFIXES:
         if parts and parts[0] == prefix:
             rest_parts = parts[1:]
-            if user and rest_parts and rest_parts[0] == user:
-                rest_parts = rest_parts[1:]
+            actor = user or "user"
+            if rest_parts and _sanitize_actor(rest_parts[0]) == actor:
+                # Drop one or more leading actor segments
+                while len(rest_parts) >= 2 and _sanitize_actor(rest_parts[0]) == actor:
+                    rest_parts = rest_parts[1:]
             rest = "/".join(rest_parts) or _basename(path)
-            return user or "user", prefix, rest
+            rest = _strip_leading_actor(rest, actor) or _basename(path)
+            return actor, prefix, rest
 
     # Fallback: treat as artifacts/{actor}/{filename}
     return user or "user", "artifacts", _basename(path)

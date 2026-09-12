@@ -225,7 +225,7 @@ def _enqueue_worker(payload: Dict[str, Any], context: Any) -> None:
 | `runtimeClientError` / `internalServerException` / `validationException` | 즉시 `RuntimeError` → job `FAILED` |
 | 읽기 타임아웃·스트림 끊김 | partial 텍스트와 함께 에러 (idle timeout은 job budget과 맞춤, 기본 1800초) |
 
-스트림이 끝난 뒤 텍스트가 너무 짧거나 “진행하겠습니다” 같은 미완료 꼬리면 `_incomplete_result_reason`이 실패로 올려, 잘린 응답을 성공으로 저장하지 않습니다. Harness 안에서는 모델이 MCP(websearch, code interpreter)와 skills로 문서를 읽고 산출물을 만들며, 그 **최종 assistant 텍스트**만 `contentBlockDelta`로 Lambda에 전달됩니다.
+스트림이 끝난 뒤 `stopReason=max_output_tokens_exceeded`이거나, 텍스트가 너무 짧거나 “진행하겠습니다” 같은 미완료 꼬리면 `_incomplete_result_reason`이 실패로 올려, 잘린 응답을 성공으로 저장하지 않습니다. Harness 세션 예산은 `maxTokens=200000`(installer `HARNESS_MAX_TOKENS`)입니다. Harness 안에서는 모델이 MCP(websearch, code interpreter)와 skills로 문서를 읽고 산출물을 만들며, 그 **최종 assistant 텍스트**만 `contentBlockDelta`로 Lambda에 전달됩니다.
 
 ```146:161:document-ai/lambda-harness/lambda_function.py
 def _client():

@@ -54,6 +54,9 @@ DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 LAMBDA_JOB_TIMEOUT_SECONDS = 1800
 HARNESS_TIMEOUT_SECONDS = 1800
 HARNESS_MAX_ITERATIONS = 100
+# Session-wide token budget for the harness run (tool loops + final answer).
+# Per-turn model maxTokens remains get_max_output_tokens(model_id).
+HARNESS_MAX_TOKENS = 200000
 LMI_MAX_VCPU_COUNT = 30
 LMI_MIN_EXECUTION_ENVIRONMENTS = 3
 LMI_MAX_EXECUTION_ENVIRONMENTS = 6
@@ -1562,6 +1565,17 @@ def ensure_harness_max_iterations(harness_id: str, max_iterations: int) -> None:
     update_harness_safe(harness_id, maxIterations=max_iterations)
 
 
+def ensure_harness_max_tokens(harness_id: str, max_tokens: int) -> None:
+    """Keep session-wide harness maxTokens high enough for long tool-heavy analyses."""
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current = h.get("maxTokens")
+    if current == max_tokens:
+        logger.info(f"  Harness maxTokens already {max_tokens}")
+        return
+    logger.info(f"  Updating harness maxTokens {current!r} -> {max_tokens}")
+    update_harness_safe(harness_id, maxTokens=max_tokens)
+
+
 def ensure_harness_tools(harness_id: str, code_interpreter_arn: str = "") -> None:
     desired = _default_harness_tools(code_interpreter_arn)
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
@@ -1705,7 +1719,7 @@ def create_or_get_harness(
                     "config": {"slidingWindow": {"messagesCount": 50}},
                 },
                 maxIterations=HARNESS_MAX_ITERATIONS,
-                maxTokens=50000,
+                maxTokens=HARNESS_MAX_TOKENS,
                 timeoutSeconds=HARNESS_TIMEOUT_SECONDS,
                 environment=environment,
                 environmentVariables=env_vars,
@@ -1733,6 +1747,7 @@ def create_or_get_harness(
     ensure_harness_skills(harness_id, s3_bucket)
     ensure_harness_timeout(harness_id, HARNESS_TIMEOUT_SECONDS)
     ensure_harness_max_iterations(harness_id, HARNESS_MAX_ITERATIONS)
+    ensure_harness_max_tokens(harness_id, HARNESS_MAX_TOKENS)
     harness_arn = wait_for_harness_ready(harness_id)
     return {
         "harness_id": harness_id,
@@ -2387,6 +2402,7 @@ def deploy_harness_stack(
         "lambdaJobTimeoutSeconds": LAMBDA_JOB_TIMEOUT_SECONDS,
         "harnessTimeoutSeconds": HARNESS_TIMEOUT_SECONDS,
         "harnessMaxIterations": HARNESS_MAX_ITERATIONS,
+        "harnessMaxTokens": HARNESS_MAX_TOKENS,
         "jobsTableName": jobs_info["jobsTableName"],
         "jobsTableArn": jobs_info["jobsTableArn"],
         "apiGatewayId": api_info["api_id"],

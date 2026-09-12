@@ -100,6 +100,10 @@
       /https?:\/\/[^\s)<>"]+/g,
       function (url) {
         var clean = url.replace(/[),.;]+$/, "");
+        // Keep already-correct API viewer URLs (just ensure access_token).
+        if (isApiArtifactViewerUrl(clean)) {
+          return ensureAccessToken(clean) + url.slice(clean.length);
+        }
         var key = extractS3Key(clean);
         if (!key) return url;
         return rewriteSharedArtifactUrl(clean, key) + url.slice(clean.length);
@@ -107,20 +111,63 @@
     );
   }
 
-  function rewriteSharedArtifactUrl(url, s3Key) {
-    var key = s3Key || extractS3Key(url);
-    if (!key || !documentsUrl) return rewriteDownloadUrl(url, key);
-    var lower = key.toLowerCase();
-    var isViewer =
+  function isApiArtifactViewerUrl(url) {
+    try {
+      var u = new URL(url);
+      return /\/artifacts\/(view|download)\//i.test(u.pathname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function ensureAccessToken(url) {
+    var token = (auth && (auth.accessToken || auth.idToken)) || "";
+    if (!token) return url;
+    try {
+      var u = new URL(url);
+      if (!u.searchParams.get("access_token")) {
+        u.searchParams.set("access_token", token);
+      }
+      return u.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
+  function isViewerArtifactKey(key) {
+    var lower = String(key || "").toLowerCase();
+    return (
       /^artifacts\//i.test(key) &&
-      /\.(md|markdown|json|csv)$/i.test(lower);
-    if (!isViewer) return rewriteDownloadUrl(url, key);
+      !/^artifacts\/(view|download)\//i.test(key) &&
+      /\.(md|markdown|json|csv)$/i.test(lower)
+    );
+  }
+
+  function rewriteSharedArtifactUrl(url, s3Key) {
+    if (isApiArtifactViewerUrl(url)) {
+      return ensureAccessToken(url);
+    }
+    var key = normalizeArtifactKey(s3Key);
+    if (!key) key = extractS3Key(url);
+    if (!key || !documentsUrl) return rewriteDownloadUrl(url, key);
+    if (!isViewerArtifactKey(key)) return rewriteDownloadUrl(url, key);
 
     var base = String(documentsUrl).replace(/\/documents\/?$/, "");
     var token = (auth && (auth.accessToken || auth.idToken)) || "";
     var parts = key.split("/");
-    // artifacts/{user}/rest...
+    // artifacts/{user}/rest... — collapse duplicated actor segments
+    // (legacy uploads: artifacts/{user}/{user}/file.md)
+    var userSeg = parts.length >= 3 ? parts[1] : "";
     var rest = parts.length >= 3 ? parts.slice(2).join("/") : parts.slice(1).join("/");
+    if (userSeg) {
+      while (rest.indexOf(userSeg + "/") === 0) {
+        rest = rest.slice(userSeg.length + 1);
+      }
+    }
+    // Guard: never treat API action segment as a user id
+    if (userSeg === "view" || userSeg === "download") {
+      rest = parts.slice(2).join("/") || parts.slice(1).join("/");
+    }
     var encoded = rest
       .split("/")
       .filter(Boolean)
@@ -137,8 +184,23 @@
   }
 
   function rewriteDownloadUrl(url, s3Key) {
-    var key = s3Key || extractS3Key(url);
-    if (key && documentsUrl) {
+    if (isApiArtifactViewerUrl(url)) {
+      return ensureAccessToken(url);
+    }
+    var key = normalizeArtifactKey(s3Key);
+    if (!key) key = extractS3Key(url);
+    if (!key) return url || "#";
+    if (/^artifacts\/(view|download)\//i.test(key)) {
+      var rest = key.replace(/^artifacts\/(view|download)\//i, "");
+      if (rest && /\.(md|markdown|json|csv)$/i.test(rest)) {
+        return rewriteSharedArtifactUrl(url, "artifacts/" + rest);
+      }
+      return url || "#";
+    }
+    if (isViewerArtifactKey(key)) {
+      return rewriteSharedArtifactUrl(url, key);
+    }
+    if (documentsUrl) {
       var base = String(documentsUrl).replace(/\/documents\/?$/, "");
       var token = (auth && (auth.accessToken || auth.idToken)) || "";
       return (
@@ -151,11 +213,27 @@
     return url;
   }
 
+  function normalizeArtifactKey(key) {
+    var k = String(key || "").replace(/^\/+/, "");
+    // Accidentally captured API route as an object key
+    if (/^artifacts\/(view|download)\//i.test(k)) {
+      return "";
+    }
+    return k;
+  }
+
   function extractS3Key(url) {
     try {
       var u = new URL(url);
       var host = u.hostname;
       var path = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+      // API Gateway viewer/download routes are NOT S3 keys
+      if (/\/artifacts\/(view|download)\//i.test(u.pathname)) {
+        return "";
+      }
+      if (/^artifacts\/(view|download)\//i.test(path)) {
+        return "";
+      }
       // bucket.s3...amazonaws.com/key
       if (/\.s3[.\-].*\.amazonaws\.com$/i.test(host) || /\.s3\.amazonaws\.com$/i.test(host)) {
         return path;
@@ -168,10 +246,6 @@
       // CloudFront / custom sharing host: path is the object key
       if (/^(artifacts|images|docs)\//i.test(path)) {
         return path;
-      }
-      // Already an API viewer URL — leave as-is (caller won't rewrite)
-      if (/\/artifacts\/(view|download)\//i.test(u.pathname)) {
-        return "";
       }
     } catch (_) {}
     return "";
@@ -188,7 +262,8 @@
     items.forEach(function (link) {
       var a = document.createElement("a");
       a.className = "chip";
-      a.href = rewriteDownloadUrl(link.url, link.s3_key);
+      // md/json/csv → viewer; others → /download?key= real S3 key
+      a.href = rewriteSharedArtifactUrl(link.url, link.s3_key);
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       a.textContent = link.label || link.url;

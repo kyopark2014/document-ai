@@ -30,6 +30,8 @@ Code Interpreter에서 만든 산출물을 **프로젝트 S3 + CloudFront**로 �
 
 ```
 - [ ] 1. 산출물을 ARTIFACTS_DIR (또는 images/docs) 아래에 저장
+  - ARTIFACTS_DIR은 이미 `/mnt/workspace/{actor_id}/artifacts` 이므로 **그 안에 actor_id 폴더를 또 만들지 말 것**
+  - 예: `$ARTIFACTS_DIR/report.md` (O) / `$ARTIFACTS_DIR/user01/report.md` (X → S3 키가 이중으로 쌓임)
 - [ ] 2. doc-sharing skill 동기화 (필요 시)
 - [ ] 3. share_artifact.py 실행 → stdout JSON의 url / viewer_url 확인
 - [ ] 4. 최종 답변에 공유 URL 포함 (로컬 경로만 안내 금지)
