@@ -61,6 +61,286 @@ AgentCore Harness (document_ai, VPC private, memory off)
 | Code interpreter | `document_ai_code` |
 | Region | `us-west-2` |
 
+### Cognito 인증
+
+Cognito User Pool은 **ess-work가 소유**하며, document-ai는 이를 공유해 사용합니다. installer가 `../ess-work/application/config.json`에서 pool/client/region을 읽어 Lambda 환경 변수와 `html/config.js`에 주입합니다. uninstaller는 Cognito를 삭제하지 않습니다.
+
+역할은 **로그인(토큰 발급)** 과 **API 검증** 으로 나뉩니다.
+
+| 단계 | 주체 | 내용 |
+|------|------|------|
+| 로그인 | 브라우저 JS (`html/app.js`) | `amazon-cognito-identity-js`로 Cognito에 ID/비밀번호를 보내고 JWT(`idToken`, `accessToken`)를 받아 `localStorage`에 저장 |
+| API 호출 | 브라우저 | `Authorization: Bearer <accessToken>` 헤더를 API Gateway에 전달 |
+| 토큰 검증 | Lambda | Cognito `GetUser`로 Access Token을 검증 (PyJWT/cryptography 미사용). 유효하면 username을 추출해 API 처리 |
+
+```
+Browser (CloudFront → S3 html/)
+    │  1) amazon-cognito-identity-js → Cognito User Pool 로그인
+    │     JWT 발급 → localStorage
+    │  2) API 요청 + Bearer Access Token
+    ▼
+API Gateway → Lambda
+    │  cognito-idp:GetUser(AccessToken)
+    ▼
+문서/job API 처리
+```
+
+로그인 자체는 Lambda가 하지 않습니다. Lambda는 요청마다 토큰이 유효한지만 확인합니다.
+
+### Harness Agent의 활용
+
+「분석하기」는 Harness를 Gateway에 동기 붙잡지 않습니다. **짧은 job 생성 + 비동기 worker + 폴링**으로 긴 분석을 처리합니다. (API Gateway HTTP API integration timeout은 최대 30초)
+
+#### 브라우저 → job 생성
+
+`html/app.js`의 `analyze()`가 선택 문서·프롬프트로 `POST /jobs`를 호출합니다.
+
+```903:938:document-ai/html/app.js
+  async function analyze(prompt) {
+    // ...
+      var created = await createJob(q, sessionId, selectedDocumentsPayload());
+      // ...
+      setResult("loading", "에이전트가 문서를 분석하는 중입니다…");
+      var job = await pollJob(created.jobId);
+```
+
+```807:821:document-ai/html/app.js
+  async function createJob(prompt, sessionId, documents) {
+    var response = await fetch(jobsUrl, {
+      method: "POST",
+      headers: Object.assign(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        authHeader()
+      ),
+      body: JSON.stringify({
+        prompt: prompt,
+        sessionId: sessionId,
+        documents: documents,
+        actorId: auth && auth.username,
+      }),
+    });
+```
+
+1. Cognito Access Token을 `Authorization: Bearer …`로 붙임  
+2. body: `{ prompt, sessionId, documents, actorId }`  
+3. Lambda가 토큰 검증 후 DynamoDB(`dynamodb-document-ai-jobs`)에 job을 `QUEUED`로 저장  
+4. 같은 Lambda를 `InvocationType=Event`로 한 번 더 호출해 worker를 enqueue  
+5. 즉시 **`202 Accepted`** + `{ jobId, status, sessionId }` 반환 (Gateway 왕복은 수 초 이내)
+
+```1960:2010:document-ai/lambda-harness/lambda_function.py
+    item = {
+        "jobId": job_id,
+        "status": "QUEUED",
+        "prompt": full_prompt,
+        # ...
+    }
+    _put_job(item)
+
+    worker_payload: Dict[str, Any] = {
+        "jobWorker": True,
+        "jobId": job_id,
+        "prompt": full_prompt,
+        "sessionId": session_id,
+        "skills": skills,
+    }
+    # ...
+    _enqueue_worker(worker_payload, context)
+
+    return _response(
+        202,
+        {
+            "jobId": job_id,
+            "status": "QUEUED",
+            "sessionId": session_id,
+            "pollPath": f"/jobs/{job_id}",
+        },
+    )
+```
+
+```589:601:document-ai/lambda-harness/lambda_function.py
+def _enqueue_worker(payload: Dict[str, Any], context: Any) -> None:
+    # ...
+    _lambda().invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+```
+
+#### Lambda worker → InvokeHarness
+
+비동기 worker(`jobWorker: true`)는 API Gateway를 거치지 않습니다.
+
+1. job 상태를 `RUNNING`으로 갱신  
+2. `_collect_harness_text()` → boto3 **`invoke_harness`** 로 Harness에 user 메시지를 보내고, 응답 **이벤트 스트림**을 끝까지 소비  
+3. 산출물 다운로드 URL을 정리한 뒤 DynamoDB에 저장  
+   - 성공: `status=SUCCEEDED`, `result`(분석 텍스트), `downloadLinks`  
+   - 실패: `status=FAILED`, `error`  
+4. Harness/Code Interpreter가 만든 파일(xlsx/pptx 등)은 skill(doc-sharing 등)이 **S3**(`artifacts/…`)에 올리고, 그 CloudFront/다운로드 URL이 `result`·`downloadLinks`에 포함됨  
+
+스트림을 끝까지 소비한 뒤에야 DynamoDB에 `SUCCEEDED`를 씁니다.
+
+```2038:2075:document-ai/lambda-harness/lambda_function.py
+        _update_job(job_id, status="RUNNING")
+    # ...
+        result = _collect_harness_text(
+            HARNESS_ARN,
+            prompt,
+            session_id,
+            actor_id=actor_id,
+            skills=skills,
+        )
+        result, truncated = _truncate_result(result)
+        result, links = _rewrite_result_download_urls(result)
+        attrs: Dict[str, Any] = {
+            "status": "SUCCEEDED",
+            "result": result,
+            "sessionId": session_id,
+        }
+        # ...
+        if links:
+            attrs["downloadLinks"] = json.dumps(links, ensure_ascii=False)
+        _update_job(job_id, **attrs)
+```
+
+`invoke_harness` 요청 인자:
+
+| 인자 | 역할 |
+|------|------|
+| `harnessArn` | document-ai Harness 런타임 ARN |
+| `runtimeSessionId` | 브라우저 `sessionId` — 같은 세션에서 대화/도구 상태 유지 |
+| `messages` | `role=user` + 분석 프롬프트(선택 문서 경로 포함) |
+| `actorId` | Cognito username — skill·artifacts 경로(`/mnt/workspace/{actor}/…`)에 사용 |
+| `skills` | S3 skill 목록(doc-sharing, regulation-evaluator 등) |
+
+스트림 이벤트 처리:
+
+| 이벤트 | Lambda 동작 |
+|--------|-------------|
+| `contentBlockDelta` | `delta.text`를 chunk로 이어 붙여 최종 응답 텍스트 구성 |
+| `messageStop` | `stopReason` 기록 (완료/중단 판별) |
+| `runtimeClientError` / `internalServerException` / `validationException` | 즉시 `RuntimeError` → job `FAILED` |
+| 읽기 타임아웃·스트림 끊김 | partial 텍스트와 함께 에러 (idle timeout은 job budget과 맞춤, 기본 1800초) |
+
+스트림이 끝난 뒤 텍스트가 너무 짧거나 “진행하겠습니다” 같은 미완료 꼬리면 `_incomplete_result_reason`이 실패로 올려, 잘린 응답을 성공으로 저장하지 않습니다. Harness 안에서는 모델이 MCP(websearch, code interpreter)와 skills로 문서를 읽고 산출물을 만들며, 그 **최종 assistant 텍스트**만 `contentBlockDelta`로 Lambda에 전달됩니다.
+
+```146:161:document-ai/lambda-harness/lambda_function.py
+def _client():
+    global _runtime_client
+    if _runtime_client is None:
+        _runtime_client = boto3.client(
+            "bedrock-agentcore",
+            region_name=BEDROCK_REGION,
+            config=Config(
+                read_timeout=HARNESS_INVOKE_READ_TIMEOUT,
+                connect_timeout=60,
+                retries={"max_attempts": 0},
+            ),
+        )
+```
+
+```455:523:document-ai/lambda-harness/lambda_function.py
+    kwargs: Dict[str, Any] = {
+        "harnessArn": harness_arn,
+        "runtimeSessionId": session_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": prompt}],
+            }
+        ],
+    }
+    if actor_id:
+        kwargs["actorId"] = actor_id
+    if skills:
+        kwargs["skills"] = skills
+
+    response = _client().invoke_harness(**kwargs)
+    stream = response.get("stream")
+    if stream is None:
+        raise RuntimeError(f"Empty Harness response: {response}")
+
+    chunks: list[str] = []
+    # ...
+    try:
+        for event in stream:
+            if "contentBlockDelta" in event:
+                # delta.text → chunks
+            elif "messageStop" in event:
+                # stopReason 기록
+            elif "runtimeClientError" in event:
+                raise RuntimeError(...)
+            # internalServerException / validationException 동일
+    except (ReadTimeoutError, EventStreamError) as e:
+        raise RuntimeError(...) from e
+
+    text = "".join(chunks)
+    incomplete = _incomplete_result_reason(text, last_stop_reason)
+    if incomplete:
+        raise RuntimeError(incomplete)
+    return text
+```
+
+#### 브라우저 폴링 → 화면 표시
+
+```
+분석하기 클릭
+  → POST /jobs  (202 + jobId)
+  → GET /jobs/{jobId} 을 2.5초마다 반복 (최대 30분)
+       QUEUED / RUNNING → 로딩 메시지
+       SUCCEEDED → result·downloadLinks 표시
+       FAILED → 에러 표시
+```
+
+```21:23:document-ai/html/app.js
+  const POLL_INTERVAL_MS = 2500;
+  // Match Lambda/Harness job budget (30 min).
+  const POLL_MAX_MS = 30 * 60 * 1000;
+```
+
+```853:871:document-ai/html/app.js
+  async function pollJob(jobId) {
+    var started = Date.now();
+    var lastStatus = "";
+    while (Date.now() - started < POLL_MAX_MS) {
+      var job = await getJob(jobId);
+      var status = String(job.status || "");
+      // ... QUEUED / RUNNING UI ...
+      if (status === "SUCCEEDED") return job;
+      if (status === "FAILED") {
+        throw new Error(job.error || "분석 작업이 실패했습니다.");
+      }
+      await sleep(POLL_INTERVAL_MS);
+    }
+```
+
+| 항목 | 값 |
+|------|-----|
+| 폴링 API | `GET /jobs/{jobId}` (API Gateway → Lambda → DynamoDB GetItem) |
+| 주기 | **2.5초** (`POLL_INTERVAL_MS = 2500`) |
+| 상한 | **30분** (`POLL_MAX_MS`, Lambda/Harness job budget과 동일) |
+| job·결과 저장소 | **DynamoDB** `dynamodb-document-ai-jobs` (`result`, `downloadLinks`, `status`) |
+| 산출물 파일 | **S3** (doc-sharing 등이 `artifacts/`에 PutObject) |
+| UI 캐시 | 진행 중 job은 `sessionStorage`, 마지막 성공 결과는 `localStorage`에 잠시 보관 (새로고침 재개용) |
+
+`SUCCEEDED`이면 `job.result`를 마크다운으로 렌더하고, `downloadLinks`로 다운로드 버튼을 그립니다. Gateway는 job 생성·상태 조회만 담당하고, 긴 대기는 Event worker가 맡습니다.
+
+```291:304:document-ai/html/app.js
+  function applySucceededJob(job, prompt) {
+    // ...
+    var resultText = (job && job.result) || "(응답이 비어 있습니다)";
+    setResult("idle", resultText, { markdown: true });
+    setDownloads((job && job.downloadLinks) || []);
+    saveLastResult({
+      prompt: prompt || "",
+      resultText: resultText,
+      downloadLinks: (job && job.downloadLinks) || [],
+    });
+```
+
 ### VPC를 이용한 보완
 
 PUBLIC 네트워크에 Harness·Lambda를 두면 AWS API 호출이 인터넷(또는 계정 default VPC)을 경유합니다. document-ai는 **전용 VPC**를 만들고 Harness와 Lambda Managed Instances를 **같은 private 서브넷**에 두어, (1) 런타임 아웃바운드를 서브넷·SG로 제한하고 (2) S3/DynamoDB/Bedrock 등 AWS 서비스는 **VPC Endpoint**로만 PrivateLink/Gateway 경로를 타게 합니다. 패턴은 ess-work 네트워크 모듈과 동일합니다.
