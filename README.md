@@ -4,8 +4,18 @@
 
 ## Architecture
 
+전체적인 architecture는 아래와 같습니다.
+
 <img width="1000" alt="image" src="https://github.com/user-attachments/assets/1859d94d-c8e0-49ea-8a90-cef03195019f" />
 
+사용자는 HTTPS로 CloudFront에 접속하고, CloudFront가 S3에 올린 정적 웹(html/js/css)을 제공합니다. API 호출은 API Gateway(`/jobs` 등)로 들어가며, Amazon Cognito(IdP)로 인증합니다.
+
+API Gateway 뒤의 **AWS Lambda (LMI)** 가 job 생성·폴링·문서 API를 처리하고, job 상태는 **DynamoDB**에 둡니다. 긴 분석은 Lambda가 **Amazon Bedrock AgentCore**의 Agent Runtime(Harness)을 호출해 수행합니다.
+
+AgentCore 안에서는 Harness가 **MCP**(websearch, code interpreter)와 **Skills**(docx, pdf, pptx, doc sharing 등)로 문서를 다루고, 산출물·스킬 파일은 **S3**에 저장합니다. 추론은 **Amazon Bedrock**의 Anthropic Claude / OpenAI GPT 모델을 사용할 수 있습니다.
+
+
+요청 흐름 요약:
 
 ```
 Browser (CloudFront → S3 web/)
@@ -17,22 +27,29 @@ API Gateway HTTP API  (~30s integration timeout)
   GET  /documents, /download …
     ▼
 Lambda Managed Instances  (lambda-harness-document-ai)
-  Capacity Provider + VPC (default VPC public subnets)
+  Capacity Provider + 전용 VPC private subnets
   • API 경로: 동기 호출 (문서 조회·job 생성, ≤15분 한도이나 실제는 수 초)
   • Worker: InvocationType=Event 비동기 (최대 30분, LMI async)
       → DynamoDB status RUNNING → InvokeHarness 스트림 대기
       → SUCCEEDED / FAILED
     ▼
-AgentCore Harness (document_ai, PUBLIC, memory off)
+AgentCore Harness (document_ai, VPC private, memory off)
   timeoutSeconds=1800
-  + Code Interpreter (document_ai_code)
+  + Code Interpreter (document_ai_code, PUBLIC)
   + Skills: doc-sharing, regulation-evaluator, testcase-generator, pptx, docx, xlsx
+  + VPC endpoints: S3/DynamoDB Gateway, Bedrock Runtime/AgentCore, ECR, Logs, Secrets Manager
+  + NAT: Cognito·기타 퍼블릭 HTTPS
 ```
 
 **ESS-work 연동:** 형제 경로 `../ess-work/application/config.json`에서 Cognito·S3·sharing URL을 읽어 Lambda 환경 변수와 `html/config.js`에 주입합니다.
 
 | Resource | Name |
 |---|---|
+| VPC | `vpc-for-document-ai` (2 AZ public/private + NAT) |
+| S3 Gateway VPCE | `s3-endpoint-document-ai` |
+| DynamoDB Gateway VPCE | `dynamodb-endpoint-document-ai` |
+| Interface VPCEs | ECR, Logs, Secrets Manager, Bedrock Runtime, AgentCore, AgentCore Control |
+| Agent runtime SG | `agent-runtime-sg-for-document-ai` |
 | S3 | `storage-for-document-ai-{account}-{region}` |
 | Jobs table | `dynamodb-document-ai-jobs` |
 | Lambda (LMI) | `lambda-harness-document-ai` |
@@ -43,6 +60,191 @@ AgentCore Harness (document_ai, PUBLIC, memory off)
 | Harness API name | `document_ai` |
 | Code interpreter | `document_ai_code` |
 | Region | `us-west-2` |
+
+### VPC를 이용한 보완
+
+PUBLIC 네트워크에 Harness·Lambda를 두면 AWS API 호출이 인터넷(또는 계정 default VPC)을 경유합니다. document-ai는 **전용 VPC**를 만들고 Harness와 Lambda Managed Instances를 **같은 private 서브넷**에 두어, (1) 런타임 아웃바운드를 서브넷·SG로 제한하고 (2) S3/DynamoDB/Bedrock 등 AWS 서비스는 **VPC Endpoint**로만 PrivateLink/Gateway 경로를 타게 합니다. 패턴은 ess-work 네트워크 모듈과 동일합니다.
+
+#### 왜 VPC인가 (접근 제어)
+
+| 계층 | 역할 |
+|------|------|
+| **Private subnet** | Harness ENI·LMI EC2에 public IP를 주지 않음. 인바운드 인터넷 직접 노출 없음 |
+| **Security Group** | `agent-runtime-sg-for-document-ai`, `document-ai-lmi-sg`로 egress 허용 범위를 관리. VPCE SG(`vpce-sg-for-document-ai`)는 VPC CIDR → `:443`만 허용 |
+| **VPC Endpoint** | S3·DynamoDB·Bedrock 트래픽이 NAT/인터넷을 거치지 않고 AWS 백본으로만 이동 (데이터 경로·비용·노출면 축소) |
+| **NAT Gateway** | Cognito JWKS 등 **endpoint가 없는** HTTPS만 private → NAT → IGW |
+| **IAM** | 네트워크와 직교. Harness role의 `VpcNetworkInterface`로 ENI 생성 권한, S3/Bedrock은 별도 정책 |
+
+정리하면 **누가 어디에 붙을 수 있는지**는 VPC/SG가, **어떤 AWS API를 호출할 수 있는지**는 IAM이 담당합니다.
+
+#### 트래픽 흐름
+
+```
+                    ┌──────────── vpc-for-document-ai ────────────┐
+                    │  public ×2 AZ          private ×2 AZ        │
+API GW ──invoke──►  │  [NAT + IGW]  ◄──0.0.0.0/0──  ┌─────────┐ │
+                    │                               │ LMI CP  │ │
+                    │                               │ Lambda  │ │
+                    │                               └────┬────┘ │
+                    │                                    │      │
+                    │                               ┌────┴────┐ │
+                    │                               │ Harness │ │
+                    │                               │ (VPC)   │ │
+                    │                               └────┬────┘ │
+                    │  Gateway VPCE: S3, DynamoDB ◄──────┤      │
+                    │  Interface VPCE: Bedrock*, ECR,    │      │
+                    │    Logs, Secrets Manager     ◄─────┘      │
+                    │  (그 외 HTTPS → NAT)                       │
+                    └───────────────────────────────────────────┘
+```
+
+1. **Lambda (LMI)** 와 **Harness** 가 동일 `private_subnets`를 사용 → 같은 VPC 라우팅·DNS·endpoint를 공유합니다.  
+2. Lambda → DynamoDB(jobs), S3(문서/artifacts), `InvokeHarness`(AgentCore data plane) 호출은 private DNS로 **해당 VPCE**에 붙습니다.  
+3. Harness → Bedrock 모델·AgentCore·ECR 이미지 pull·S3 skills/artifacts 도 동일하게 endpoint(또는 S3 Gateway)를 탑니다.  
+4. Code Interpreter는 현재 `networkMode: PUBLIC`(관리형 샌드박스). Harness↔CI 제어면은 AgentCore API(VPC endpoint)로 연결됩니다.
+
+#### 프로비저닝 순서
+
+`deploy_harness_stack`이 먼저 VPC를 만든 뒤, 같은 `vpc_info`를 Harness·Lambda에 넘깁니다.
+
+```2331:2349:document-ai/installer.py
+    vpc_info = _vpc_provisioner().ensure_vpc()
+    upload_skills_to_s3(target_bucket)
+    jobs_info = create_jobs_table()
+    execution_role_arn = create_harness_execution_role(target_bucket, ess_s3)
+    code_info = create_or_get_code_interpreter(execution_role_arn)
+    harness_info = create_or_get_harness(
+        execution_role_arn,
+        target_bucket,
+        vpc_info,
+        code_interpreter_arn=code_info["code_interpreter_arn"],
+        ess_s3_bucket=ess_s3,
+    )
+    lambda_arn = create_lambda_harness(
+        harness_info["harness_arn"],
+        target_bucket,
+        jobs_info["jobsTableName"],
+        ess,
+        vpc_info,
+    )
+```
+
+#### Harness: `networkMode: VPC`
+
+Create/UpdateHarness 시 private 서브넷 + agent runtime SG를 지정합니다. 런타임 ENI가 해당 서브넷에만 생기고, 아웃바운드는 SG·라우트·endpoint 규칙을 따릅니다.
+
+```117:144:document-ai/vpc_network.py
+    def build_harness_runtime_environment(
+        self, vpc_info: Dict[str, object]
+    ) -> Dict:
+        """CreateHarness/UpdateHarness environment with networkMode VPC."""
+        return {
+            "agentCoreRuntimeEnvironment": {
+                "lifecycleConfiguration": {
+                    "idleRuntimeSessionTimeout": 600,
+                    "maxLifetime": 14400,
+                },
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {
+                        "subnets": list(vpc_info.get("private_subnets") or []),
+                        "securityGroups": list(
+                            vpc_info.get("agent_runtime_security_groups") or []
+                        ),
+                    },
+                },
+            }
+        }
+
+    def lmi_vpc_config(self, vpc_info: Dict[str, object]) -> Dict[str, List[str]]:
+        """VpcConfig for Lambda Managed Instances capacity provider."""
+        return {
+            "SubnetIds": list(vpc_info.get("private_subnets") or []),
+            "SecurityGroupIds": list(vpc_info.get("lmi_security_groups") or []),
+        }
+```
+
+Harness execution role에는 VPC ENI 조작 권한이 필요합니다.
+
+```1127:1140:document-ai/installer.py
+        {
+            "Sid": "VpcNetworkInterface",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkInterface",
+                "ec2:DescribeNetworkInterfaces",
+                "ec2:DeleteNetworkInterface",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeVpcs",
+                "ec2:AssignPrivateIpAddresses",
+                "ec2:UnassignPrivateIpAddresses",
+            ],
+            "Resource": ["*"],
+        },
+```
+
+#### Lambda: 같은 VPC의 Capacity Provider
+
+LMI는 Capacity Provider의 `VpcConfig`로 EC2를 띄웁니다. `lmi_vpc_config`가 Harness와 **동일한 private_subnets** + `document-ai-lmi-sg`를 넘기므로 Lambda와 Harness가 같은 네트워크 평면에 놓입니다. 기존 CP가 default VPC에 있으면 installer가 CP·함수를 지우고 전용 VPC로 재생성합니다.
+
+#### S3 Gateway / DynamoDB·Bedrock Interface endpoint
+
+`ensure_private_subnet_vpc_endpoints`가 private(및 public) 라우트 테이블에 Gateway를 묶고, private 서브넷에 Interface endpoint ENI를 둡니다.
+
+| 타입 | 서비스 | 용도 |
+|------|--------|------|
+| **Gateway** | `s3` | skills sync, artifacts Put/Get, ECR 레이어 — 라우트 테이블 prefix list |
+| **Gateway** | `dynamodb` | jobs 테이블 Get/Put/Update — Lambda worker 경로 |
+| **Interface** | `bedrock-runtime` | Claude 등 모델 호출 |
+| **Interface** | `bedrock-agentcore` / `…-control` | InvokeHarness·런타임/제어면 |
+| **Interface** | `ecr.api` / `ecr.dkr` | Harness 관리형 이미지 pull |
+| **Interface** | `logs`, `secretsmanager` | 런타임 로그·시크릿 |
+
+```532:578:document-ai/vpc_network.py
+        interface_services = [
+            (f"com.amazonaws.{self.region}.ecr.api", f"ecr-api-endpoint-{self.project_name}"),
+            (f"com.amazonaws.{self.region}.ecr.dkr", f"ecr-dkr-endpoint-{self.project_name}"),
+            (f"com.amazonaws.{self.region}.logs", f"logs-endpoint-{self.project_name}"),
+            (
+                f"com.amazonaws.{self.region}.secretsmanager",
+                f"secretsmanager-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-runtime",
+                f"bedrock-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-agentcore",
+                f"bedrock-agentcore-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-agentcore-control",
+                f"bedrock-agentcore-control-endpoint-{self.project_name}",
+            ),
+        ]
+        # ...
+        endpoint_ids["s3"] = self._create_gateway_vpc_endpoint(
+            vpc_id, route_table_ids, "s3", f"s3-endpoint-{self.project_name}"
+        )
+        endpoint_ids["dynamodb"] = self._create_gateway_vpc_endpoint(
+            vpc_id,
+            route_table_ids,
+            "dynamodb",
+            f"dynamodb-endpoint-{self.project_name}",
+        )
+```
+
+Interface endpoint는 `PrivateDnsEnabled=True`이므로 boto3가 쓰는 리전 엔드포인트 호스트명이 VPC 안에서 VPCE IP로 해석됩니다. Gateway(S3/DynamoDB)는 라우트 테이블에 prefix list 경로가 추가되어, private 서브넷의 `0.0.0.0/0 → NAT`보다 **더 specific한 경로**로 AWS 백본에 붙습니다.
+
+#### 구현·정리 파일
+
+| 파일 | 역할 |
+|------|------|
+| `vpc_network.py` | VPC/서브넷/NAT/SG/VPCE 멱등 생성 |
+| `installer.py` | `ensure_vpc` → Harness VPC 모드 → LMI CP 동일 서브넷 |
+| `uninstaller.py` | VPCE → NAT/EIP → 서브넷/SG → VPC 삭제 |
+| `config.json` | `vpc_id`, `private_subnets`, `agent_runtime_security_groups` 등 기록 |
 
 ## Skills
 
@@ -128,7 +330,7 @@ LMI의 **비동기(Event) 호출**은 서비스 한도상 **최대 60분**까지
 
 **document-ai에서의 동작**
 
-1. installer가 **Capacity Provider** (`cp-document-ai`)를 만들고, default VPC의 **퍼블릭 서브넷** + 전용 SG에 붙입니다. (아웃바운드로 Bedrock·S3·DynamoDB·CloudWatch 접근)  
+1. installer가 전용 VPC(`vpc-for-document-ai`)를 만들고, **Capacity Provider** (`cp-document-ai`)를 **private 서브넷** + `document-ai-lmi-sg`에 붙입니다. S3/DynamoDB는 Gateway endpoint, Bedrock·ECR·Logs 등은 Interface endpoint(+ NAT)로 접근합니다.  
 2. **Operator IAM role** (`lambda-lmi-operator-document-ai` + `AWSLambdaManagedEC2ResourceOperator`)로 Lambda가 EC2를 기동·종료합니다.  
 3. `lambda-harness-document-ai`에 `CapacityProviderConfig`를 붙이고 worker `Timeout=1800`(30분)으로 설정합니다. HTTP(API Gateway) 쪽은 **30초** integration timeout입니다.  
 4. `$LATEST.PUBLISHED` 를 publish하면 LMI에서 활성이 됩니다. 비한정 ARN 호출은 `$LATEST.PUBLISHED`로 갑니다.  

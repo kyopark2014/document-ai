@@ -3,8 +3,8 @@
 AWS Infrastructure Uninstaller for document-ai.
 
 Deletes harness + web stack resources created by installer.py
-(API Gateway, Function URL, Lambda, jobs table, harness, code interpreter,
-IAM roles; optionally CloudFront and S3).
+(API Gateway, Function URL, Lambda, capacity provider, VPC, jobs table,
+harness, code interpreter, IAM roles; optionally CloudFront and S3).
 """
 
 import argparse
@@ -249,7 +249,7 @@ def delete_capacity_provider() -> bool:
 
 
 def delete_lmi_security_group() -> bool:
-    """Delete the dedicated LMI security group (keep default VPC)."""
+    """Delete LMI security group if orphaned outside the project VPC (legacy)."""
     try:
         groups = (
             ec2_client.describe_security_groups(
@@ -260,21 +260,292 @@ def delete_lmi_security_group() -> bool:
         if not groups:
             logger.warning(f"Security group not found: {lambda_lmi_sg_name}")
             return False
-        sg_id = groups[0]["GroupId"]
-        for _ in range(12):
-            try:
-                ec2_client.delete_security_group(GroupId=sg_id)
-                logger.info(f"✓ Deleted security group: {sg_id}")
-                return True
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "DependencyViolation":
-                    time.sleep(10)
-                    continue
-                raise
-        logger.warning(f"Could not delete security group yet (in use): {sg_id}")
-        return False
+        # Prefer deleting via delete_vpc when the SG lives in the project VPC.
+        vpc_name = f"vpc-for-{project_name}"
+        project_vpcs = {
+            v["VpcId"]
+            for v in (
+                ec2_client.describe_vpcs(
+                    Filters=[{"Name": "tag:Name", "Values": [vpc_name]}]
+                ).get("Vpcs")
+                or []
+            )
+        }
+        deleted_any = False
+        for group in groups:
+            if group["VpcId"] in project_vpcs:
+                logger.info(
+                    f"  LMI SG {group['GroupId']} belongs to project VPC; "
+                    "deleted with VPC teardown"
+                )
+                continue
+            sg_id = group["GroupId"]
+            for _ in range(12):
+                try:
+                    ec2_client.delete_security_group(GroupId=sg_id)
+                    logger.info(f"✓ Deleted legacy LMI security group: {sg_id}")
+                    deleted_any = True
+                    break
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "DependencyViolation":
+                        time.sleep(10)
+                        continue
+                    raise
+            else:
+                logger.warning(f"Could not delete security group yet (in use): {sg_id}")
+        return deleted_any
     except ClientError as e:
         logger.warning(f"Could not delete LMI security group: {e}")
+        return False
+
+
+def _resolve_vpc_id(config: Dict) -> Optional[str]:
+    if config.get("vpc_id"):
+        return str(config["vpc_id"])
+    resp = ec2_client.describe_vpcs(
+        Filters=[{"Name": "tag:Name", "Values": [f"vpc-for-{project_name}"]}]
+    )
+    vpcs = resp.get("Vpcs") or []
+    return vpcs[0]["VpcId"] if vpcs else None
+
+
+def _delete_vpc_endpoints(vpc_id: str, timeout_sec: int = 300) -> None:
+    """Delete Interface/Gateway VPC endpoints before subnet/VPC teardown."""
+    try:
+        endpoints = ec2_client.describe_vpc_endpoints(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("VpcEndpoints", [])
+    except ClientError as e:
+        logger.warning(f"  VPC endpoint list: {e}")
+        return
+
+    pending_ids: List[str] = []
+    for ep in endpoints:
+        if ep.get("State") == "deleted":
+            continue
+        ep_id = ep["VpcEndpointId"]
+        if ep.get("State") != "deleting":
+            try:
+                ec2_client.delete_vpc_endpoints(VpcEndpointIds=[ep_id])
+                logger.info(
+                    f"  ✓ Delete VPC endpoint requested: {ep_id} "
+                    f"({ep.get('ServiceName', 'unknown')})"
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "InvalidVpcEndpointId.NotFound":
+                    logger.warning(f"  Could not delete VPC endpoint {ep_id}: {e}")
+                    continue
+        else:
+            logger.info(f"  VPC endpoint already deleting: {ep_id}")
+        pending_ids.append(ep_id)
+
+    if not pending_ids:
+        return
+
+    logger.info(f"  Waiting for {len(pending_ids)} VPC endpoint(s) to delete...")
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        remaining: List[str] = []
+        for ep_id in pending_ids:
+            try:
+                current = ec2_client.describe_vpc_endpoints(
+                    VpcEndpointIds=[ep_id]
+                ).get("VpcEndpoints", [])
+                if current and current[0].get("State") != "deleted":
+                    remaining.append(ep_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "InvalidVpcEndpointId.NotFound":
+                    remaining.append(ep_id)
+        if not remaining:
+            logger.info("  ✓ All VPC endpoints deleted")
+            return
+        time.sleep(15)
+        pending_ids = remaining
+
+    logger.warning(
+        f"  {len(pending_ids)} VPC endpoint(s) still present after {timeout_sec}s"
+    )
+
+
+def delete_vpc(config: Dict) -> bool:
+    """Tear down dedicated document-ai VPC (endpoints, NAT, subnets, SGs)."""
+    logger.info("Deleting VPC resources")
+    vpc_id = _resolve_vpc_id(config)
+    if not vpc_id:
+        logger.info("  No project VPC found")
+        return False
+
+    logger.info(f"  VPC: {vpc_id}")
+    _delete_vpc_endpoints(vpc_id)
+
+    try:
+        enis = ec2_client.describe_network_interfaces(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NetworkInterfaces", [])
+        for eni in enis:
+            if eni.get("Status") == "available":
+                try:
+                    ec2_client.delete_network_interface(
+                        NetworkInterfaceId=eni["NetworkInterfaceId"]
+                    )
+                    logger.info(f"  ✓ Deleted ENI: {eni['NetworkInterfaceId']}")
+                except ClientError as e:
+                    logger.warning(f"  Could not delete ENI: {e}")
+    except ClientError as e:
+        logger.warning(f"  ENI cleanup: {e}")
+
+    nat_ids = []
+    eip_alloc_ids = set()
+    try:
+        nats = ec2_client.describe_nat_gateways(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NatGateways", [])
+        for nat in nats:
+            for addr in nat.get("NatGatewayAddresses", []):
+                if addr.get("AllocationId"):
+                    eip_alloc_ids.add(addr["AllocationId"])
+            if nat["State"] in {"deleted", "deleting"}:
+                continue
+            nat_id = nat["NatGatewayId"]
+            rts = ec2_client.describe_route_tables(
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+            ).get("RouteTables", [])
+            for rt in rts:
+                for route in rt.get("Routes", []):
+                    if route.get("NatGatewayId") == nat_id:
+                        try:
+                            ec2_client.delete_route(
+                                RouteTableId=rt["RouteTableId"],
+                                DestinationCidrBlock=route["DestinationCidrBlock"],
+                            )
+                        except ClientError:
+                            pass
+            try:
+                ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+                nat_ids.append(nat_id)
+                logger.info(f"  ✓ Delete NAT requested: {nat_id}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete NAT {nat_id}: {e}")
+    except ClientError as e:
+        logger.warning(f"  NAT cleanup: {e}")
+
+    if nat_ids:
+        logger.info("  Waiting for NAT gateways to delete...")
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            remaining = []
+            for nid in nat_ids:
+                st = ec2_client.describe_nat_gateways(NatGatewayIds=[nid])[
+                    "NatGateways"
+                ][0]["State"]
+                if st != "deleted":
+                    remaining.append(nid)
+            if not remaining:
+                break
+            time.sleep(15)
+
+    for alloc_id in eip_alloc_ids:
+        try:
+            ec2_client.release_address(AllocationId=alloc_id)
+            logger.info(f"  ✓ Released EIP: {alloc_id}")
+        except ClientError as e:
+            logger.debug(f"  EIP release {alloc_id}: {e}")
+
+    try:
+        igws = ec2_client.describe_internet_gateways(
+            Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+        ).get("InternetGateways", [])
+        for igw in igws:
+            igw_id = igw["InternetGatewayId"]
+            try:
+                ec2_client.detach_internet_gateway(
+                    InternetGatewayId=igw_id, VpcId=vpc_id
+                )
+            except ClientError:
+                pass
+            try:
+                ec2_client.delete_internet_gateway(InternetGatewayId=igw_id)
+                logger.info(f"  ✓ Deleted IGW: {igw_id}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete IGW {igw_id}: {e}")
+    except ClientError as e:
+        logger.warning(f"  IGW cleanup: {e}")
+
+    try:
+        subnets = ec2_client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("Subnets", [])
+        for sn in subnets:
+            try:
+                ec2_client.delete_subnet(SubnetId=sn["SubnetId"])
+                logger.info(f"  ✓ Deleted subnet: {sn['SubnetId']}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete subnet {sn['SubnetId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  Subnet cleanup: {e}")
+
+    try:
+        rts = ec2_client.describe_route_tables(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("RouteTables", [])
+        for rt in rts:
+            is_main = any(a.get("Main") for a in rt.get("Associations", []))
+            if is_main:
+                continue
+            for assoc in rt.get("Associations", []):
+                if assoc.get("RouteTableAssociationId") and not assoc.get("Main"):
+                    try:
+                        ec2_client.disassociate_route_table(
+                            AssociationId=assoc["RouteTableAssociationId"]
+                        )
+                    except ClientError:
+                        pass
+            try:
+                ec2_client.delete_route_table(RouteTableId=rt["RouteTableId"])
+                logger.info(f"  ✓ Deleted route table: {rt['RouteTableId']}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete RT {rt['RouteTableId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  Route table cleanup: {e}")
+
+    try:
+        sgs = ec2_client.describe_security_groups(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("SecurityGroups", [])
+        for sg in sgs:
+            if sg.get("GroupName") == "default":
+                continue
+            try:
+                if sg.get("IpPermissions"):
+                    ec2_client.revoke_security_group_ingress(
+                        GroupId=sg["GroupId"], IpPermissions=sg["IpPermissions"]
+                    )
+                if sg.get("IpPermissionsEgress"):
+                    ec2_client.revoke_security_group_egress(
+                        GroupId=sg["GroupId"],
+                        IpPermissions=sg["IpPermissionsEgress"],
+                    )
+            except ClientError:
+                pass
+        for sg in sgs:
+            if sg.get("GroupName") == "default":
+                continue
+            try:
+                ec2_client.delete_security_group(GroupId=sg["GroupId"])
+                logger.info(
+                    f"  ✓ Deleted SG: {sg['GroupId']} ({sg.get('GroupName')})"
+                )
+            except ClientError as e:
+                logger.warning(f"  Could not delete SG {sg['GroupId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  SG cleanup: {e}")
+
+    try:
+        ec2_client.delete_vpc(VpcId=vpc_id)
+        logger.info(f"✓ Deleted VPC: {vpc_id}")
+        return True
+    except ClientError as e:
+        logger.warning(f"  Could not delete VPC {vpc_id}: {e}")
         return False
 
 
@@ -759,6 +1030,7 @@ def main():
         deletion_summary["jobsTable"] = delete_jobs_table(config)
         deletion_summary["harness"] = delete_harness(config)
         deletion_summary["codeInterpreter"] = delete_code_interpreter(config)
+        deletion_summary["vpc"] = delete_vpc(config)
         deletion_summary["iamRoles"] = delete_iam_roles()
 
         if delete_cf:

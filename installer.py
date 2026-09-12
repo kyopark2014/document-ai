@@ -4,6 +4,8 @@ AWS Infrastructure Installer for document-ai.
 
 Provisions harness + web stack (S3, skills, DynamoDB jobs, AgentCore harness,
 Lambda, API Gateway, CloudFront) with ESS-work Cognito/S3 integration.
+Harness and Lambda Managed Instances run in a dedicated VPC (private subnets)
+with S3/DynamoDB gateway endpoints and Bedrock/ECR/Logs interface endpoints.
 Does NOT provision any businfo Kinesis/Glue/Firehose pipeline.
 """
 
@@ -23,6 +25,8 @@ from typing import Dict, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
+
+from vpc_network import VpcNetworkProvisioner
 
 # ---------------------------------------------------------------------------
 # Project constants
@@ -99,6 +103,17 @@ def setup_logging(log_level=logging.INFO):
 
 
 logger = setup_logging()
+
+
+def _vpc_provisioner() -> VpcNetworkProvisioner:
+    return VpcNetworkProvisioner(
+        ec2_client=ec2_client,
+        region=region,
+        account_id=account_id,
+        project_name=project_name,
+        logger=logger,
+        lmi_sg_name=lambda_lmi_sg_name,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -605,117 +620,106 @@ def create_lmi_operator_role() -> str:
     )
 
 
-def resolve_lmi_vpc_config() -> Dict[str, List[str]]:
-    """Use default VPC public subnets + a dedicated security group for LMI."""
-    logger.info("Resolving VPC config for Lambda Managed Instances")
-    vpcs = ec2_client.describe_vpcs(
-        Filters=[{"Name": "isDefault", "Values": ["true"]}]
-    ).get("Vpcs") or []
-    if not vpcs:
+def resolve_lmi_vpc_config(vpc_info: Dict[str, object]) -> Dict[str, List[str]]:
+    """Use dedicated VPC private subnets + LMI security group."""
+    logger.info("Resolving VPC config for Lambda Managed Instances (dedicated VPC)")
+    vpc_config = _vpc_provisioner().lmi_vpc_config(vpc_info)
+    if not vpc_config.get("SubnetIds") or not vpc_config.get("SecurityGroupIds"):
         raise RuntimeError(
-            "No default VPC found. Create a default VPC or pass custom subnets."
+            "Dedicated VPC is missing private subnets or LMI security group"
         )
-    vpc_id = vpcs[0]["VpcId"]
-    subnets = ec2_client.describe_subnets(
-        Filters=[
-            {"Name": "vpc-id", "Values": [vpc_id]},
-            {"Name": "default-for-az", "Values": ["true"]},
-        ]
-    ).get("Subnets") or []
-    if len(subnets) < 2:
-        subnets = ec2_client.describe_subnets(
-            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-        ).get("Subnets") or []
-    # Prefer public MapPublicIpOnLaunch subnets across AZs.
-    public = [s for s in subnets if s.get("MapPublicIpOnLaunch")]
-    chosen = public or subnets
-    by_az: Dict[str, str] = {}
-    for s in sorted(chosen, key=lambda x: x.get("AvailabilityZone") or ""):
-        az = s.get("AvailabilityZone") or ""
-        if az and az not in by_az:
-            by_az[az] = s["SubnetId"]
-    subnet_ids = list(by_az.values())[:3]
-    if not subnet_ids:
-        raise RuntimeError(f"No subnets available in default VPC {vpc_id}")
+    logger.info(
+        f"  VPC={vpc_info.get('vpc_id')} "
+        f"subnets={vpc_config['SubnetIds']} sg={vpc_config['SecurityGroupIds']}"
+    )
+    return vpc_config
 
-    sg_id = None
-    existing = ec2_client.describe_security_groups(
-        Filters=[
-            {"Name": "vpc-id", "Values": [vpc_id]},
-            {"Name": "group-name", "Values": [lambda_lmi_sg_name]},
-        ]
-    ).get("SecurityGroups") or []
-    if existing:
-        sg_id = existing[0]["GroupId"]
-        logger.info(f"  Reusing security group: {sg_id}")
-    else:
-        created = ec2_client.create_security_group(
-            GroupName=lambda_lmi_sg_name,
-            Description="Outbound access for document-ai Lambda Managed Instances",
-            VpcId=vpc_id,
-            TagSpecifications=[
-                {
-                    "ResourceType": "security-group",
-                    "Tags": [
-                        {"Key": "Project", "Value": project_name},
-                        {"Key": "Name", "Value": lambda_lmi_sg_name},
-                    ],
-                }
-            ],
-        )
-        sg_id = created["GroupId"]
-        # Default SG already allows all egress; ensure it.
+
+def _capacity_provider_vpc_matches(
+    existing_response: Dict, desired: Dict[str, List[str]]
+) -> bool:
+    """Return True if capacity provider already uses the desired VPC config."""
+    cp = existing_response.get("CapacityProvider") or existing_response
+    current = cp.get("VpcConfig") or {}
+    cur_subnets = set(current.get("SubnetIds") or [])
+    cur_sgs = set(current.get("SecurityGroupIds") or [])
+    want_subnets = set(desired.get("SubnetIds") or [])
+    want_sgs = set(desired.get("SecurityGroupIds") or [])
+    return cur_subnets == want_subnets and cur_sgs == want_sgs
+
+
+def _delete_capacity_provider_for_vpc_migrate() -> None:
+    """Delete capacity provider so it can be recreated on the dedicated VPC."""
+    logger.warning(
+        f"  Recreating capacity provider {lambda_capacity_provider_name} "
+        "on dedicated VPC private subnets"
+    )
+    # Dependent Lambda must be removed first.
+    if lambda_function_exists(lambda_harness_name):
         try:
-            ec2_client.authorize_security_group_egress(
-                GroupId=sg_id,
-                IpPermissions=[
-                    {
-                        "IpProtocol": "-1",
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                    }
-                ],
+            lambda_client.delete_function_url_config(FunctionName=lambda_harness_name)
+        except ClientError:
+            pass
+        lambda_client.delete_function(FunctionName=lambda_harness_name)
+        for _ in range(60):
+            if not lambda_function_exists(lambda_harness_name):
+                break
+            time.sleep(2)
+    try:
+        lambda_client.delete_capacity_provider(
+            CapacityProviderName=lambda_capacity_provider_name
+        )
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if "NotFound" not in code and code != "ResourceNotFoundException":
+            raise
+    for _ in range(60):
+        try:
+            lambda_client.get_capacity_provider(
+                CapacityProviderName=lambda_capacity_provider_name
             )
+            time.sleep(5)
         except ClientError as e:
-            if e.response["Error"]["Code"] not in (
-                "InvalidPermission.Duplicate",
-                "InvalidPermission.Duplicate",
-            ):
-                # Some accounts already have default allow-all egress.
-                logger.debug(f"  egress authorize skipped: {e}")
-        logger.info(f"  ✓ Security group created: {sg_id}")
-
-    logger.info(f"  VPC={vpc_id} subnets={subnet_ids} sg={sg_id}")
-    return {"SubnetIds": subnet_ids, "SecurityGroupIds": [sg_id]}
+            if "NotFound" in e.response["Error"]["Code"]:
+                return
+            raise
+    raise TimeoutError(
+        f"Timed out deleting capacity provider {lambda_capacity_provider_name}"
+    )
 
 
-def create_or_get_capacity_provider(operator_role_arn: str) -> str:
-    """Create or reuse the Lambda Managed Instances capacity provider."""
+def create_or_get_capacity_provider(
+    operator_role_arn: str, vpc_info: Dict[str, object]
+) -> str:
+    """Create or reuse the Lambda Managed Instances capacity provider on VPC."""
     logger.info(f"Creating capacity provider: {lambda_capacity_provider_name}")
     expected_arn = (
         f"arn:aws:lambda:{region}:{account_id}:capacity-provider:"
         f"{lambda_capacity_provider_name}"
     )
+    vpc_config = resolve_lmi_vpc_config(vpc_info)
+
     try:
         existing = lambda_client.get_capacity_provider(
             CapacityProviderName=lambda_capacity_provider_name
         )
-        arn = (
-            (existing.get("CapacityProvider") or {}).get("CapacityProviderArn")
-            or existing.get("CapacityProviderArn")
-            or expected_arn
-        )
-        logger.info(f"  Capacity provider already exists: {arn}")
-        return arn
+        if _capacity_provider_vpc_matches(existing, vpc_config):
+            arn = (
+                (existing.get("CapacityProvider") or {}).get("CapacityProviderArn")
+                or existing.get("CapacityProviderArn")
+                or expected_arn
+            )
+            logger.info(f"  Capacity provider already exists on dedicated VPC: {arn}")
+            return arn
+        _delete_capacity_provider_for_vpc_migrate()
     except ClientError as e:
         if e.response["Error"]["Code"] not in (
             "ResourceNotFoundException",
             "CapacityProviderNotFoundException",
         ):
-            # Older error code variants
             if "NotFound" not in e.response["Error"]["Code"]:
                 raise
 
-    vpc_config = resolve_lmi_vpc_config()
     try:
         response = lambda_client.create_capacity_provider(
             CapacityProviderName=lambda_capacity_provider_name,
@@ -1033,7 +1037,7 @@ def deploy_lambda_function(
 def create_harness_execution_role(
     s3_bucket: str, ess_s3_bucket: str = ""
 ) -> str:
-    """Create IAM execution role for Bedrock AgentCore harness (PUBLIC, no memory)."""
+    """Create IAM execution role for Bedrock AgentCore harness (VPC mode)."""
     logger.info("Creating Harness execution IAM role")
     role_name = f"role-harness-for-{project_name}-{region}"
     if len(role_name) > 64:
@@ -1117,6 +1121,21 @@ def create_harness_execution_role(
             "Sid": "EcrManagedImageToken",
             "Effect": "Allow",
             "Action": ["ecr:GetAuthorizationToken"],
+            "Resource": ["*"],
+        },
+        {
+            "Sid": "VpcNetworkInterface",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkInterface",
+                "ec2:DescribeNetworkInterfaces",
+                "ec2:DeleteNetworkInterface",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeVpcs",
+                "ec2:AssignPrivateIpAddresses",
+                "ec2:UnassignPrivateIpAddresses",
+            ],
             "Resource": ["*"],
         },
         {
@@ -1388,16 +1407,24 @@ def create_or_get_code_interpreter(execution_role_arn: str) -> Dict[str, str]:
     }
 
 
-def _public_harness_environment() -> Dict:
-    return {
-        "agentCoreRuntimeEnvironment": {
-            "lifecycleConfiguration": {
-                "idleRuntimeSessionTimeout": 600,
-                "maxLifetime": 14400,
-            },
-            "networkConfiguration": {"networkMode": "PUBLIC"},
-        }
-    }
+def _vpc_harness_environment(vpc_info: Dict[str, object]) -> Dict:
+    return _vpc_provisioner().build_harness_runtime_environment(vpc_info)
+
+
+def _harness_network_matches(
+    harness_environment: Optional[Dict], vpc_info: Dict[str, object]
+) -> bool:
+    rt = (harness_environment or {}).get("agentCoreRuntimeEnvironment") or {}
+    net = rt.get("networkConfiguration") or {}
+    if net.get("networkMode") != "VPC":
+        return False
+    cfg = net.get("networkModeConfig") or {}
+    want_subnets = set(vpc_info.get("private_subnets") or [])
+    want_sgs = set(vpc_info.get("agent_runtime_security_groups") or [])
+    return (
+        set(cfg.get("subnets") or []) == want_subnets
+        and set(cfg.get("securityGroups") or []) == want_sgs
+    )
 
 
 def ensure_harness_memory_disabled(harness_id: str) -> None:
@@ -1414,15 +1441,17 @@ def ensure_harness_memory_disabled(harness_id: str) -> None:
     )
 
 
-def ensure_harness_environment_public(harness_id: str) -> None:
-    desired = _public_harness_environment()
+def ensure_harness_environment_vpc(
+    harness_id: str, vpc_info: Dict[str, object]
+) -> None:
+    desired = _vpc_harness_environment(vpc_info)
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    if _harness_network_matches(h.get("environment"), vpc_info):
+        logger.info("  Harness environment already VPC on dedicated subnets")
+        return
     current_rt = (h.get("environment") or {}).get("agentCoreRuntimeEnvironment") or {}
     current_mode = (current_rt.get("networkConfiguration") or {}).get("networkMode")
-    if current_mode == "PUBLIC":
-        logger.info("  Harness environment already PUBLIC")
-        return
-    logger.info(f"  Updating harness networkMode {current_mode!r} -> PUBLIC")
+    logger.info(f"  Updating harness networkMode {current_mode!r} -> VPC")
     update_harness_safe(harness_id, environment=desired)
 
 
@@ -1582,11 +1611,12 @@ def ensure_harness_skills(harness_id: str, s3_bucket: str) -> None:
 def create_or_get_harness(
     execution_role_arn: str,
     s3_bucket: str,
+    vpc_info: Dict[str, object],
     code_interpreter_arn: str = "",
     ess_s3_bucket: str = "",
 ) -> Dict[str, str]:
-    """Create AgentCore Harness (PUBLIC, memory disabled) or reuse by name."""
-    logger.info("Creating AgentCore Harness (PUBLIC, memory disabled)")
+    """Create AgentCore Harness (VPC, memory disabled) or reuse by name."""
+    logger.info("Creating AgentCore Harness (VPC, memory disabled)")
 
     harness_api_name = harness_name_for_api(project_name)
     logger.info(
@@ -1595,7 +1625,7 @@ def create_or_get_harness(
 
     model_id = DEFAULT_MODEL_ID
     system_prompt = [{"text": _system_prompt_text(s3_bucket)}]
-    environment = _public_harness_environment()
+    environment = _vpc_harness_environment(vpc_info)
     tools = _default_harness_tools(code_interpreter_arn)
     skills = build_default_harness_skills(s3_bucket)
 
@@ -1695,7 +1725,7 @@ def create_or_get_harness(
             )
 
     ensure_harness_memory_disabled(harness_id)
-    ensure_harness_environment_public(harness_id)
+    ensure_harness_environment_vpc(harness_id, vpc_info)
     ensure_harness_environment_variables(harness_id, s3_bucket, ess_s3_bucket)
     ensure_harness_model(harness_id, DEFAULT_MODEL_ID)
     ensure_harness_system_prompt(harness_id, s3_bucket)
@@ -1936,6 +1966,7 @@ def create_lambda_harness(
     s3_bucket: str,
     jobs_table: str,
     ess_config: Dict[str, str],
+    vpc_info: Dict[str, object],
 ) -> str:
     """Deploy Lambda: API jobs/documents API + async worker → InvokeHarness."""
     logger.info(f"Creating Lambda: {lambda_harness_name}")
@@ -2037,7 +2068,9 @@ def create_lambda_harness(
     )
 
     operator_role_arn = create_lmi_operator_role()
-    capacity_provider_arn = create_or_get_capacity_provider(operator_role_arn)
+    capacity_provider_arn = create_or_get_capacity_provider(
+        operator_role_arn, vpc_info
+    )
 
     source_dir = os.path.join(lambda_base_dir, "lambda-harness")
     environment = {
@@ -2290,11 +2323,12 @@ def deploy_harness_stack(
     s3_bucket: Optional[str] = None,
     ess_config: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Provision Harness + jobs table + Lambda + API Gateway + Function URL."""
+    """Provision VPC + Harness + jobs table + Lambda + API Gateway + Function URL."""
     target_bucket = s3_bucket or bucket_name or resolve_bucket_name(account_id, region)
     ess = ess_config or load_ess_work_config()
     ess_s3 = (ess.get("s3_bucket") or "").strip()
 
+    vpc_info = _vpc_provisioner().ensure_vpc()
     upload_skills_to_s3(target_bucket)
     jobs_info = create_jobs_table()
     execution_role_arn = create_harness_execution_role(target_bucket, ess_s3)
@@ -2302,6 +2336,7 @@ def deploy_harness_stack(
     harness_info = create_or_get_harness(
         execution_role_arn,
         target_bucket,
+        vpc_info,
         code_interpreter_arn=code_info["code_interpreter_arn"],
         ess_s3_bucket=ess_s3,
     )
@@ -2310,6 +2345,7 @@ def deploy_harness_stack(
         target_bucket,
         jobs_info["jobsTableName"],
         ess,
+        vpc_info,
     )
     function_url = create_lambda_function_url(lambda_harness_name)
     api_info = create_api_gateway(lambda_arn)
@@ -2332,9 +2368,18 @@ def deploy_harness_stack(
         "HARNESS_ID": harness_info["harness_id"],
         "harnessName": harness_info["harness_name"],
         "harnessExecutionRole": execution_role_arn,
+        "harnessNetworkMode": "VPC",
         "codeInterpreterId": code_info["code_interpreter_id"],
         "codeInterpreterArn": code_info["code_interpreter_arn"],
         "codeInterpreterName": code_info["code_interpreter_name"],
+        "vpc_id": vpc_info.get("vpc_id") or "",
+        "public_subnets": list(vpc_info.get("public_subnets") or []),
+        "private_subnets": list(vpc_info.get("private_subnets") or []),
+        "agent_runtime_vpc_subnets": list(vpc_info.get("private_subnets") or []),
+        "agent_runtime_security_groups": list(
+            vpc_info.get("agent_runtime_security_groups") or []
+        ),
+        "lmi_security_group_id": vpc_info.get("lmi_security_group_id") or "",
         "lambdaHarnessName": lambda_harness_name,
         "lambdaHarnessArn": lambda_arn,
         "lambdaCapacityProvider": lambda_capacity_provider_name,
