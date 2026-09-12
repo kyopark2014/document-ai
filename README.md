@@ -10,7 +10,7 @@
 
 사용자는 HTTPS로 CloudFront에 접속하고, CloudFront가 S3에 올린 정적 웹(html/js/css)을 제공합니다. API 호출은 API Gateway(`/jobs` 등)로 들어가며, Amazon Cognito(IdP)로 인증합니다.
 
-API Gateway 뒤의 **AWS Lambda (LMI)** 가 job 생성·폴링·문서 API를 처리하고, job 상태는 **DynamoDB**에 둡니다. 긴 분석은 Lambda가 **Amazon Bedrock AgentCore**의 Agent Runtime(Harness)을 호출해 수행합니다.
+API Gateway 뒤의 **AWS Lambda (LMI: Lambda Managed Instances)** 가 job 생성·폴링·문서 API를 처리하고, job 상태는 **DynamoDB**에 둡니다. 긴 분석은 Lambda가 **Amazon Bedrock AgentCore**의 Agent Runtime(Harness)을 호출해 수행합니다.
 
 AgentCore 안에서는 Harness가 **MCP**(websearch, code interpreter)와 **Skills**(docx, pdf, pptx, doc sharing 등)로 문서를 다루고, 산출물·스킬 파일은 **S3**에 저장합니다. 추론은 **Amazon Bedrock**의 Anthropic Claude / OpenAI GPT 모델을 사용할 수 있습니다.
 
