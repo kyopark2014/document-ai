@@ -657,7 +657,7 @@ def _presign(
         if inline:
             params["ResponseContentDisposition"] = f'inline; filename="{safe_name}"'
         else:
-            params["ResponseContentDisposition"] = f'attachment; filename="{safe_name}"'
+            params["ResponseContentDisposition"] = _content_disposition(safe_name)
         if content_type:
             params["ResponseContentType"] = content_type
         return _s3_client().generate_presigned_url(
@@ -670,16 +670,30 @@ def _presign(
         return None
 
 
+def _content_disposition(file_name: str, *, disposition: str = "attachment") -> str:
+    """Build latin-1-safe Content-Disposition (RFC 5987 filename*)."""
+    raw = (file_name or "download").replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_name = raw.encode("ascii", "ignore").decode("ascii").strip(" .") or "download"
+    ascii_name = re.sub(r"_+", "_", ascii_name).strip("._") or "download"
+    _, ext = os.path.splitext(raw)
+    if ext and not ascii_name.lower().endswith(ext.lower()):
+        base = ascii_name if ascii_name != "download" else "download"
+        ascii_name = f"{base}{ext}"
+    return (
+        f'{disposition}; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(raw)}"
+    )
+
+
 def _attachment_response(
     data: bytes, file_name: str, media_type: str
 ) -> Dict[str, Any]:
     """Stream a file download through API Gateway (harness-work style)."""
-    safe_name = (file_name or "download").replace('"', "")
     return {
         "statusCode": 200,
         "headers": {
             "Content-Type": media_type,
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": _content_disposition(file_name),
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
         },
